@@ -162,7 +162,12 @@ export async function getUserById(id) {
 }
 
 export function verifyAccessToken(token) {
-  return jwt.verify(token, JWT_ACCESS_SECRET);
+  try {
+    return jwt.verify(token, JWT_ACCESS_SECRET);
+  } catch (err) {
+    console.error('[BACKEND-AUTH-VERIFY-ERR] Secret used length:', JWT_ACCESS_SECRET.length, 'Secret prefix:', JWT_ACCESS_SECRET.substring(0, 4) + '...', 'Error:', err.message);
+    throw err;
+  }
 }
 
 // Dipakai Auth.tsx saat registrasi (real-time check sebelum submit).
