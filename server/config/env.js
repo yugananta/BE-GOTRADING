@@ -19,7 +19,7 @@ function optional(name, fallback = null) {
   return process.env[name] || fallback;
 }
 
-export const PORT = 3000;
+export const PORT = Number(process.env.PORT || 3000);
 export const FRONTEND_URL = optional('FRONTEND_URL', '*'); // batasi ini di production, jangan biarkan '*'
 export const ADMIN_FRONTEND_URL = optional('ADMIN_FRONTEND_URL', '*'); // URL admin panel (AI Studio project terpisah)
 
