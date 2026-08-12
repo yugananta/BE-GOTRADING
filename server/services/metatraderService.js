@@ -558,33 +558,15 @@ export async function connectMyAccount(userId, { platform, login, password, serv
 }
 
 export async function disconnectMyAccount(userId, akunId = null) {
-  // Minta gateway melepas sesi MT5 (best-effort).
-  // 404 = gateway tidak punya sesi ini (sudah restart / session lost) → anggap berhasil.
-  // Jangan biarkan error gateway menghalangi update status DB.
-  try {
-    await gatewayDisconnect();
-  } catch (err) {
-    // 404 = gateway tidak punya sesi ini (restart / session expired) — OK, lanjut update DB.
-    // Error lain (503, timeout) juga tidak menghalangi: kita tetap update DB.
-    const isNotFound = err?.status === 404 || String(err?.message || '').toLowerCase().includes('not found');
-    if (isNotFound) {
-      console.info('[MT5] gatewayDisconnect: sesi tidak ditemukan di gateway (404) — dianggap sudah terputus.');
-    } else {
-      console.warn('[MT5] gatewayDisconnect gagal saat user disconnect:', err.message);
-    }
-  }
+  // Minta gateway melepas sesi MT5 (best-effort) secara asynchronous agar tidak memblokir HTTP response
+  gatewayDisconnect().catch((err) => {
+    console.warn('[MT5] gatewayDisconnect gagal saat user disconnect (background):', err.message);
+  });
 
-  // UPDATE ke 'disconnected' (bukan DELETE) agar:
-  //   1. History transaksi user tetap tersimpan.
-  //   2. Monitor auto-reconnect berhenti mencoba (conn_status='disconnected' & credential_saved=false).
-  //   3. Baris tetap ada sebagai referensi audit.
-  //
-  // PENTING: akunId WAJIB diisi kalau user punya lebih dari 1 akun terhubung.
-  // Kalau akunId falsy (null/undefined), query TIDAK difilter per akun dan
-  // akan men-disconnect SEMUA akun milik user ini sekaligus. Pastikan
-  // pemanggil (route handler) selalu mengirim akun_id yang benar.
+  // Hapus akun dari database (DELETE) agar benar-benar terputus dan hilang dari list UI
+  // sesuai pesan konfirmasi frontend: "Riwayat transaksi akun ini akan dihapus dari aplikasi."
   if (!akunId) {
-    console.warn('[MT5] disconnectMyAccount dipanggil TANPA akunId -- akan memutus SEMUA akun user ini:', userId);
+    console.warn('[MT5] disconnectMyAccount dipanggil TANPA akunId -- akan menghapus SEMUA akun user ini:', userId);
   }
 
   let targetAkunId = null;
@@ -617,18 +599,9 @@ export async function disconnectMyAccount(userId, akunId = null) {
     }
   }
 
-  const nowIso = new Date().toISOString();
   let query = supabase
     .from('user_mt5_accounts')
-    .update({
-      conn_status: CONN_STATUS.DISCONNECTED,
-      status: 'disconnected',
-      credential_saved: false,
-      error_message: null,
-      reconnect_attempts: 0,
-      next_reconnect_at: null,
-      updated_at: nowIso,
-    })
+    .delete()
     .eq('user_id', userId);
 
   if (targetRowId) {
