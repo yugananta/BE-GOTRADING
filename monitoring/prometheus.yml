@@ -1,0 +1,46 @@
+# monitoring/prometheus.yml
+# STEP 14 — Konfigurasi Prometheus scrape untuk TARAPTI (Bab 20.1)
+#
+# Deploy di monitoring server terpisah (bukan di VPS produksi).
+# Contoh: Docker Compose di VPS monitoring, atau Grafana Cloud.
+#
+# Jalankan:
+#   docker run -d -p 9090:9090 \
+#     -v $(pwd)/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml \
+#     -v $(pwd)/monitoring/alerts.yml:/etc/prometheus/alerts.yml \
+#     prom/prometheus
+
+global:
+  scrape_interval:     30s
+  evaluation_interval: 30s
+  external_labels:
+    environment: 'production'
+    project:     'tarapti'
+
+# --- Alert rules ---
+rule_files:
+  - "alerts.yml"
+
+# --- Alertmanager (opsional: notifikasi ke Slack/Telegram/email) ---
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # Backend Railway (Node.js) — endpoint /metrics
+  - job_name: 'tarapti-backend'
+    scrape_interval: 30s
+    scheme: https      # Railway menggunakan HTTPS
+    static_configs:
+      - targets: ['<RAILWAY_BACKEND_HOST>']  # Ganti dengan hostname Railway
+    metrics_path: '/metrics'
+
+  # MT5 Gateway VPS (Python app.py) — endpoint /metrics port 8000
+  # Hanya dapat diakses dari private network / VPN — JANGAN ekspos ke publik
+  - job_name: 'tarapti-gateway'
+    scrape_interval: 30s
+    scheme: http
+    static_configs:
+      - targets: ['<IP_VPS>:8000']   # Ganti dengan IP VPS Windows
+    metrics_path: '/metrics'

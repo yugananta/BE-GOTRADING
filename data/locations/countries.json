@@ -1,0 +1,6 @@
+[
+  { "id": 101, "name": "Indonesia", "iso2": "ID", "iso3": "IDN", "phonecode": "62", "currency": "IDR", "emoji": "🇮🇩" },
+  { "id": 113, "name": "Japan", "iso2": "JP", "iso3": "JPN", "phonecode": "81", "currency": "JPY", "emoji": "🇯🇵" },
+  { "id": 14, "name": "Australia", "iso2": "AU", "iso3": "AUS", "phonecode": "61", "currency": "AUD", "emoji": "🇦🇺" },
+  { "id": 233, "name": "United States", "iso2": "US", "iso3": "USA", "phonecode": "1", "currency": "USD", "emoji": "🇺🇸" }
+]

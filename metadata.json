@@ -1,0 +1,8 @@
+{
+  "name": "TARAPTI Backend",
+  "description": "Backend API for GoTrading / TARAPTI - auth, MT5 gateway, news, analytics, and social core",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

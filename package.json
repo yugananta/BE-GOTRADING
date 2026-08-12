@@ -1,0 +1,25 @@
+{
+  "name": "tarapti-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Backend mandiri TARAPTI - auth, integrasi MT5 gateway, news, dan API lainnya. Dipanggil oleh frontend AI Studio via BACKEND_API_URL.",
+  "scripts": {
+    "build": "echo 'No build step required'",
+    "start": "node server/index.js",
+    "dev": "nodemon server/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.12.0",
+    "prom-client": "^15.1.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
