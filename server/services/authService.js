@@ -120,7 +120,7 @@ export async function loginUser({ email, password }) {
   };
 }
 
-export function refreshAccessToken(refreshToken) {
+export async function refreshAccessToken(refreshToken) {
   if (!refreshToken) {
     const err = new Error('Refresh token wajib dikirim');
     err.status = 400;
@@ -136,7 +136,11 @@ export function refreshAccessToken(refreshToken) {
   }
   // Ambil role terbaru dari DB (bukan dari token lama) supaya kalau role
   // berubah setelah refresh token diterbitkan, access token baru tetap akurat.
-  return getUserById(payload.sub).then((user) => signAccessToken(user));
+  const user = await getUserById(payload.sub);
+  return {
+    accessToken: signAccessToken(user),
+    refreshToken: signRefreshToken(user),
+  };
 }
 
 export async function getUserById(id) {

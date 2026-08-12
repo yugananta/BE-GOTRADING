@@ -28,8 +28,8 @@ router.post('/login', async (req, res, next) => {
 
 router.post('/refresh', async (req, res, next) => {
   try {
-    const accessToken = await refreshAccessToken(req.body.refreshToken);
-    res.json({ accessToken });
+    const result = await refreshAccessToken(req.body.refreshToken);
+    res.json(result);
   } catch (err) {
     next(err);
   }
