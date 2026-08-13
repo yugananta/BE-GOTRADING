@@ -31,10 +31,18 @@ export const DIRECT_URL = optional('DIRECT_URL', '');
 // --- Auth (JWT custom) ---
 // SELALU dibaca dari environment variable Railway yang FIXED (JWT_SECRET / JWT_ACCESS_SECRET / JWT_REFRESH_SECRET).
 // Kunci ini TIDAK BOLEH digenerate secara acak saat startup Node.js.
-const rawJwtSecret = process.env.JWT_SECRET || process.env.JWT_ACCESS_SECRET || 'tarapti-jwt-access-secret-32-chars';
+const rawJwtSecret = process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET;
+if (!rawJwtSecret) {
+  throw new Error('JWT_ACCESS_SECRET (atau JWT_SECRET) env var wajib diset, tidak boleh kosong');
+}
 export const JWT_ACCESS_SECRET = rawJwtSecret;
 export const JWT_SECRET = rawJwtSecret; // Alias untuk kompatibilitas jika dipanggil dengan nama JWT_SECRET
-export const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.JWT_REFRESH_SECRET_KEY || rawJwtSecret;
+
+const rawJwtRefreshSecret = process.env.JWT_REFRESH_SECRET || process.env.JWT_REFRESH_SECRET_KEY;
+if (!rawJwtRefreshSecret) {
+  throw new Error('JWT_REFRESH_SECRET env var wajib diset, tidak boleh kosong');
+}
+export const JWT_REFRESH_SECRET = rawJwtRefreshSecret;
 
 // --- MT5 Gateway API (TARAPTI, repo terpisah) - dipakai untuk WRITE:
 // daftar akun baru, trigger resync
