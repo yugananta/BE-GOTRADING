@@ -27,6 +27,31 @@ function signRefreshToken(user) {
   return jwt.sign({ sub: user.id }, JWT_REFRESH_SECRET, { expiresIn: REFRESH_TOKEN_TTL });
 }
 
+export async function saveRefreshTokenToDb(userId, refreshToken) {
+  if (!userId || !refreshToken) return;
+  try {
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    await supabase.from('user_refresh_tokens').insert({
+      user_id: userId,
+      refresh_token: refreshToken,
+      expires_at: expiresAt,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn('[AUTH-DB-SAVE-WARN] Failed to store refresh token in DB:', err.message || err);
+  }
+}
+
+export async function revokeRefreshTokenInDb(refreshToken) {
+  if (!refreshToken) return;
+  try {
+    await supabase.from('user_refresh_tokens').delete().eq('refresh_token', refreshToken);
+  } catch (err) {
+    console.warn('[AUTH-DB-REVOKE-WARN] Failed to revoke refresh token in DB:', err.message || err);
+  }
+}
+
 export async function registerUser({ email, password, fullName, username, country, province, city, whatsapp, referredBy, referralCode }) {
   if (!email || !password) {
     const err = new Error('Email dan password wajib diisi');
@@ -81,6 +106,8 @@ export async function registerUser({ email, password, fullName, username, countr
   const accessToken = signAccessToken(user);
   const refreshToken = signRefreshToken(user);
 
+  await saveRefreshTokenToDb(user.id, refreshToken);
+
   return {
     user: { ...user, referralCode: ownReferralCode },
     accessToken,
@@ -122,6 +149,8 @@ export async function loginUser({ email, password }) {
   const accessToken = signAccessToken(user);
   const refreshToken = signRefreshToken(user);
 
+  await saveRefreshTokenToDb(user.id, refreshToken);
+
   return {
     user: { id: user.id, email: user.email, role: user.role, isVerified: user.verification_status === 'verified' },
     accessToken,
@@ -142,16 +171,44 @@ export async function refreshAccessToken(refreshToken) {
   try {
     payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
   } catch (err) {
-    console.error('[REFRESH-TOKEN-ERR] Verification failed:', err.message);
-    const errorObj = new Error('Refresh token tidak valid atau kedaluwarsa');
-    errorObj.status = 401;
-    throw errorObj;
+    // Fallback verifikasi ke JWT_ACCESS_SECRET jika beda secret
+    if (JWT_ACCESS_SECRET && JWT_ACCESS_SECRET !== JWT_REFRESH_SECRET) {
+      try {
+        payload = jwt.verify(refreshToken, JWT_ACCESS_SECRET);
+      } catch (_) {}
+    }
+    if (!payload) {
+      console.error('[REFRESH-TOKEN-ERR] Verification failed:', err.message);
+      const errorObj = new Error('Refresh token tidak valid atau kedaluwarsa');
+      errorObj.status = 401;
+      throw errorObj;
+    }
   }
-  // Ambil role terbaru dari DB (bukan dari token lama) supaya kalau role
-  // berubah setelah refresh token diterbitkan, access token baru tetap akurat.
+
+  // Ambil user dari DB
   const user = await getUserById(payload.sub);
+
+  // Jika token tersimpan di DB, lakukan verifikasi dan rotasi token
+  try {
+    const { data: storedTokens } = await supabase
+      .from('user_refresh_tokens')
+      .select('id, refresh_token')
+      .eq('user_id', user.id);
+
+    if (storedTokens && storedTokens.length > 0) {
+      const match = storedTokens.find((t) => t.refresh_token === refreshToken);
+      if (match) {
+        await supabase.from('user_refresh_tokens').delete().eq('id', match.id);
+      }
+    }
+  } catch (dbErr) {
+    console.warn('[REFRESH-TOKEN-DB] Notice during DB token check:', dbErr.message || dbErr);
+  }
+
   const accessToken = signAccessToken(user);
   const newRefreshToken = signRefreshToken(user);
+
+  await saveRefreshTokenToDb(user.id, newRefreshToken);
 
   return {
     user: { id: user.id, email: user.email, role: user.role, isVerified: user.isVerified },

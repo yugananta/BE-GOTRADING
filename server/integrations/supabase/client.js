@@ -13,7 +13,8 @@ const actualSupabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 // In-memory mock database tables for offline testing
 const mockDb = {
   users: [],
-  user_mt5_accounts: []
+  user_mt5_accounts: [],
+  user_refresh_tokens: []
 };
 
 function createMockQueryBuilder(tableName) {
@@ -179,7 +180,7 @@ function createMockQueryBuilder(tableName) {
 
 // Reset isi mock database (dipakai test otomasi supaya tiap skenario
 // berjalan dari kondisi bersih). Hanya aktif saat bukan production.
-export function resetMockDb(tables = ['users', 'user_mt5_accounts']) {
+export function resetMockDb(tables = ['users', 'user_mt5_accounts', 'user_refresh_tokens']) {
   if (isProduction) return;
   for (const t of tables) mockDb[t] = [];
 }
