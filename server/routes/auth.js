@@ -28,7 +28,8 @@ router.post('/login', async (req, res, next) => {
 
 router.post('/refresh', async (req, res, next) => {
   try {
-    const result = await refreshAccessToken(req.body.refreshToken);
+    const refreshToken = req.body?.refreshToken || req.body?.refresh_token || req.body?.token;
+    const result = await refreshAccessToken(refreshToken);
     res.json(result);
   } catch (err) {
     next(err);

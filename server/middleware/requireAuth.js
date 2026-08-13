@@ -11,9 +11,13 @@ export function requireAuth(req, res, next) {
     console.warn('[BACKEND-AUTH] Authorization header missing or does not start with Bearer:', header);
     return res.status(401).json({ error: 'Token tidak ditemukan' });
   }
-  const token = header.slice('Bearer '.length);
+  const rawToken = header.slice('Bearer '.length).trim().replace(/^["']|["']$/g, '');
+  if (!rawToken || rawToken === 'undefined' || rawToken === 'null') {
+    console.warn('[BACKEND-AUTH] Empty or malformed token string provided:', header);
+    return res.status(401).json({ error: 'Token tidak valid atau kedaluwarsa' });
+  }
   try {
-    const verified = verifyAccessToken(token); // { sub: userId, email } or { userId }
+    const verified = verifyAccessToken(rawToken); // { sub: userId, email } or { userId }
     console.log('[BACKEND-AUTH-OK] Token verified successfully for sub/userId:', verified.sub || verified.userId);
     req.user = {
       sub: verified.sub || verified.userId,

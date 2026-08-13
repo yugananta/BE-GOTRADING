@@ -78,10 +78,16 @@ export async function registerUser({ email, password, fullName, username, countr
   // tanpa perlu langkah tambahan.
   const ownReferralCode = await ensureReferralCode(user.id);
 
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
+
   return {
     user: { ...user, referralCode: ownReferralCode },
-    accessToken: signAccessToken(user),
-    refreshToken: signRefreshToken(user),
+    accessToken,
+    token: accessToken,
+    access_token: accessToken,
+    refreshToken,
+    refresh_token: refreshToken,
   };
 }
 
@@ -113,10 +119,16 @@ export async function loginUser({ email, password }) {
     throw err;
   }
 
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
+
   return {
     user: { id: user.id, email: user.email, role: user.role, isVerified: user.verification_status === 'verified' },
-    accessToken: signAccessToken(user),
-    refreshToken: signRefreshToken(user),
+    accessToken,
+    token: accessToken,
+    access_token: accessToken,
+    refreshToken,
+    refresh_token: refreshToken,
   };
 }
 
@@ -129,17 +141,25 @@ export async function refreshAccessToken(refreshToken) {
   let payload;
   try {
     payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
-  } catch {
-    const err = new Error('Refresh token tidak valid atau kedaluwarsa');
-    err.status = 401;
-    throw err;
+  } catch (err) {
+    console.error('[REFRESH-TOKEN-ERR] Verification failed:', err.message);
+    const errorObj = new Error('Refresh token tidak valid atau kedaluwarsa');
+    errorObj.status = 401;
+    throw errorObj;
   }
   // Ambil role terbaru dari DB (bukan dari token lama) supaya kalau role
   // berubah setelah refresh token diterbitkan, access token baru tetap akurat.
   const user = await getUserById(payload.sub);
+  const accessToken = signAccessToken(user);
+  const newRefreshToken = signRefreshToken(user);
+
   return {
-    accessToken: signAccessToken(user),
-    refreshToken: signRefreshToken(user),
+    user: { id: user.id, email: user.email, role: user.role, isVerified: user.isVerified },
+    accessToken,
+    token: accessToken,
+    access_token: accessToken,
+    refreshToken: newRefreshToken,
+    refresh_token: newRefreshToken,
   };
 }
 
