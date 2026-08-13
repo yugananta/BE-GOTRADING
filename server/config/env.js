@@ -30,7 +30,7 @@ export const DIRECT_URL = optional('DIRECT_URL', '');
 
 // --- Auth (JWT custom) ---
 export const JWT_ACCESS_SECRET = required('JWT_ACCESS_SECRET', 'tarapti-jwt-access-secret-32-chars');
-export const JWT_REFRESH_SECRET = optional('JWT_REFRESH_SECRET', process.env.JWT_ACCESS_SECRET || 'tarapti-jwt-refresh-secret-32-chars');
+export const JWT_REFRESH_SECRET = optional('JWT_REFRESH_SECRET', JWT_ACCESS_SECRET);
 
 // --- MT5 Gateway API (TARAPTI, repo terpisah) - dipakai untuk WRITE:
 // daftar akun baru, trigger resync

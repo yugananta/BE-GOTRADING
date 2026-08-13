@@ -185,6 +185,11 @@ export function verifyAccessToken(token) {
   try {
     return jwt.verify(token, JWT_ACCESS_SECRET);
   } catch (err) {
+    if (JWT_REFRESH_SECRET && JWT_REFRESH_SECRET !== JWT_ACCESS_SECRET) {
+      try {
+        return jwt.verify(token, JWT_REFRESH_SECRET);
+      } catch (_) {}
+    }
     console.error('[BACKEND-AUTH-VERIFY-ERR] Secret used length:', JWT_ACCESS_SECRET.length, 'Secret prefix:', JWT_ACCESS_SECRET.substring(0, 4) + '...', 'Error:', err.message);
     throw err;
   }

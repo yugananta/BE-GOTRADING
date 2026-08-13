@@ -63,7 +63,7 @@ function isAuthError(err) {
   if (!err) return false;
   if (err.status === 401) return true;
   const msg = String(err.message || err.body?.detail || '').toLowerCase();
-  return /login|password|credential|invalid|authentication|invalid_user_or_password/i.test(msg);
+  return /invalid_user_or_password|invalid login|invalid password|wrong password|invalid credential|authentication failed|auth_failed|authorization/i.test(msg);
 }
 
 async function getMyAkunRow(userId, akunId = null) {
@@ -429,13 +429,14 @@ export async function connectMyAccount(userId, { platform, login, password, serv
         errorMessage = 'Koneksi diproses. Sistem akan otomatis terhubung.';
       }
     } catch (err) {
+      console.error('[MT5-CONNECT-ERR] Gateway connect failed:', err.message, err.body || '');
       if (isAuthError(err)) {
         connStatus = CONN_STATUS.ERROR;
-        errorMessage = 'Credential MT5 invalid atau sudah kedaluwarsa. Silakan periksa kembali dan hubungkan ulang.';
+        errorMessage = err.body?.detail || err.message || 'Credential MT5 invalid atau sudah kedaluwarsa. Silakan periksa kembali dan hubungkan ulang.';
       } else {
         connStatus = CONN_STATUS.RECONNECTING;
         errorMessage = gwState.reachable
-          ? 'Gagal terhubung sekarang. Sistem akan mencoba lagi secara otomatis.'
+          ? (err.body?.detail || err.message || 'Gagal terhubung sekarang. Sistem akan mencoba lagi secara otomatis.')
           : GATEWAY_UNAVAILABLE_MSG;
       }
     }
