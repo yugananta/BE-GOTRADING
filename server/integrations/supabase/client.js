@@ -186,7 +186,13 @@ export function resetMockDb(tables = ['users', 'user_mt5_accounts']) {
 
 // Production: use real Supabase for ALL tables (including users, user_mt5_accounts).
 // Non-production (local dev / test): keep Mock Proxy so offline tests don't need a live DB.
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = process.env.NODE_ENV === 'production' || (
+  SUPABASE_URL &&
+  SUPABASE_URL !== 'https://mock.supabase.co' &&
+  !SUPABASE_URL.includes('mock.supabase.co') &&
+  SUPABASE_SERVICE_ROLE_KEY &&
+  SUPABASE_SERVICE_ROLE_KEY !== 'mock-service-role-key'
+);
 
 export const supabase = isProduction
   ? actualSupabase
