@@ -77,7 +77,7 @@ export async function runReconnectCycle() {
   }
 
   const accounts = (rows || []).filter(
-    (r) => r.credential_saved === true && r.conn_status !== 'disconnected' && Number(r.akun_id) >= 1_000_000
+    (r) => r.credential_saved === true && r.conn_status !== 'disconnected' && Number(r.akun_id) > 0
   );
   if (accounts.length === 0) return;
 
@@ -111,6 +111,7 @@ export async function runReconnectCycle() {
         reconnect_attempts: 0,
         next_reconnect_at: null,
       });
+      hijackedThisCycle = true;
       continue;
     }
 

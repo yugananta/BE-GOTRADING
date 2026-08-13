@@ -166,7 +166,7 @@ export async function getMyAccount(userId, akunId = null) {
   let gw = null;
   let live = false;
   try {
-    const liveGw = await getAccount();
+    const liveGw = await getAccount(3000);
     if (liveGw && Number(liveGw.login) === Number(row.akun_id)) {
       gw = liveGw;
       live = true;
@@ -248,7 +248,7 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
   let gwDeals = [];
 
   try {
-    const gw = await getAccount();
+    const gw = await getAccount(3000);
     // Live trades hanya diambil jika gateway sedang terhubung ke akun_id yang tepat!
     if (gw && Number(gw.login) === Number(row.akun_id)) {
       gwTrades = await getTrades();
@@ -629,7 +629,7 @@ export async function syncMyAccount(userId, akunId = null) {
   let gwDeals = [];
   let live = false;
   try {
-    gw = await getAccount();
+    gw = await getAccount(3000);
     // PERMINTAAN KLIEN: Sync trades HANYA jika gateway terhubung pada akun_id yang sama!
     if (gw && Number(gw.login) === Number(row.akun_id)) {
       live = true;
@@ -718,7 +718,7 @@ export async function listMyAccounts(userId) {
   // dan jangan override ke reconnecting — watchdog yang akan menangani reconnect.
   let gatewayReachable = false;
   try {
-    liveGw = await getAccount();
+    liveGw = await getAccount(3000);
     // getAccount() sukses = gateway reachable dan MT5 terminal aktif
     gatewayReachable = !!(liveGw && liveGw.login != null);
   } catch (err) {
@@ -776,7 +776,7 @@ export async function listMyPositions(userId, { akunId = null } = {}) {
 
   let gwPositions = null;
   try {
-    const gw = await getAccount();
+    const gw = await getAccount(3000);
     if (gw && Number(gw.login) === Number(row.akun_id)) {
       gwPositions = await getPositions();
     }
@@ -828,7 +828,7 @@ export async function listMyDeals(userId, { limit = 200, akunId = null } = {}) {
   const limitNum = Number(limit) || 200;
   let gwDeals = null;
   try {
-    const gw = await getAccount();
+    const gw = await getAccount(3000);
     if (gw && Number(gw.login) === Number(row.akun_id)) {
       gwDeals = await getDeals();
     }
@@ -880,7 +880,7 @@ export async function listMyOrders(userId, { akunId = null } = {}) {
 
   let gwOrders = null;
   try {
-    const gw = await getAccount();
+    const gw = await getAccount(3000);
     if (gw && Number(gw.login) === Number(row.akun_id)) {
       gwOrders = await getOrders();
     }

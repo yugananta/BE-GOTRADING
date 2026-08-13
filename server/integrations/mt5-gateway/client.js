@@ -105,8 +105,8 @@ async function request(path, { method = 'GET', body, timeout = 15000 } = {}) {
 }
 
 // Sesuai GET /account di app.py (profil + balance akun sesi gateway)
-export function getAccount() {
-  return request('/account');
+export function getAccount(timeout = 15000) {
+  return request('/account', { timeout });
 }
 
 // Sesuai GET /positions di app.py
@@ -149,7 +149,7 @@ export function getSymbol(symbol) {
 // status CONNECTED / RECONNECTING / DISCONNECTED / ERROR.
 export async function getGatewayState() {
   try {
-    const account = await getAccount();
+    const account = await getAccount(3000);
     return {
       reachable: true,
       login: account && account.login != null ? Number(account.login) : null,
@@ -157,6 +157,9 @@ export async function getGatewayState() {
       error: null,
     };
   } catch (err) {
+    if (err instanceof MT5GatewayError) {
+      return { reachable: true, login: null, account: null, error: err };
+    }
     return { reachable: false, login: null, account: null, error: err };
   }
 }
