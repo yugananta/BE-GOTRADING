@@ -6,6 +6,7 @@
 
 import { supabase } from '../integrations/supabase/client.js';
 import { MT5_GATEWAY_URL, MT5GW_API_KEY } from '../config/env.js';
+import { getGatewayHealth } from '../integrations/mt5-gateway/client.js';
 
 const COLUMN_MAP = {
   mt5Server: 'mt5_server',
@@ -43,33 +44,24 @@ export async function saveSettings(body) {
   return toCamel(data);
 }
 
-// [CATATAN] MT5 Gateway (app.py) sudah punya endpoint /health publik --
+// [CATATAN] MT5 Gateway (app.py) punya endpoint /health --
 // yang dites di sini adalah KETERJANGKAUAN JARINGAN + status koneksi MT5.
 export async function testMt5Connection() {
   try {
-    const res = await fetch(`${MT5_GATEWAY_URL}/health`, {
-      headers: { 'x-api-key': MT5GW_API_KEY },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.status === 401) {
-      const err = new Error('MT5GW_API_KEY salah -- gateway menolak API key ini');
-      err.status = 502;
-      throw err;
-    }
-    if (!res.ok) {
-      const err = new Error(`MT5 Gateway mengembalikan status ${res.status}`);
-      err.status = 502;
-      throw err;
-    }
-    const data = await res.json();
+    const data = await getGatewayHealth();
     return {
       message: 'MT5 Gateway terjangkau dan terhubung ke MT5.',
-      status: data.status,
-      broker: data.broker,
-      login: data.login,
-      server: data.server,
+      status: data?.status || 'ok',
+      broker: data?.broker,
+      login: data?.login,
+      server: data?.server,
     };
   } catch (err) {
+    if (err.status === 401) {
+      const authErr = new Error('MT5_GATEWAY_API_KEY salah -- gateway menolak API key ini (401 Unauthorized)');
+      authErr.status = 502;
+      throw authErr;
+    }
     if (err.status) throw err;
     const wrapped = new Error('Tidak bisa menghubungi MT5 Gateway. Cek MT5_GATEWAY_URL dan pastikan VPS/app.py sedang berjalan.');
     wrapped.status = 502;

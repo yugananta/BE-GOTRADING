@@ -1,23 +1,20 @@
 // server/services/mt5ReconnectService.js
 //
-// MONITOR AUTO-RECONNECT MT5
+// MONITOR AUTO-RECONNECT MT5 (STATELESS GATEWAY)
 // ---------------------------------------------------------------
-// Tujuan: memastikan koneksi akun MT5 TIDAK hilang karena restart/deploy
-// backend ataupun restart MT5 Gateway / MT5 terminal di VPS.
+// Tujuan: memastikan kredensial akun MT5 tersinkronisasi dan status koneksi
+// selalu akurat saat gateway/terminal MT5 di VPS mengalami restart.
 //
-// Cara kerja (loop interval, aman tanpa infinite loop):
+// Cara kerja (loop interval, sequential queue):
 //   1. Ambil semua akun yang credential_saved = true (tersimpan di DB).
-//   2. Probe koneksi gateway (GET /account).
-//      - Gateway tidak reachable  -> semua akun = RECONNECTING, tunggu.
-//      - Gateway reachable & login == akun -> akun = CONNECTED.
-//      - Gateway reachable tapi akun bukan sesi aktif -> coba gatewayConnect()
-//        memakai credential terenkripsi yang tersimpan.
-//   3. Retry memakai exponential backoff (mulai 10 detik, naik 2x tiap
-//      gagal, maksimal 10 menit) dan batas MAX_ATTEMPTS sebelum berhenti
-//      (menghindari infinite loop). Setelah batas -> status ERROR dan user
-//      diminta connect ulang.
-//   4. Credential invalid / expired -> status ERROR (tidak retry terus).
-//   5. Monitor TIDAK PERNAH menghapus baris account dari database.
+//   2. Probe kesehatan gateway (GET /health).
+//      - Gateway tidak reachable -> semua akun = RECONNECTING.
+//   3. Untuk tiap akun dengan credential:
+//      - Dekripsi password investor.
+//      - Kirim POST /connect ke gateway.
+//      - Jika sukses -> status CONNECTED & update snapshot.
+//      - Jika auth error (401/invalid user) -> status ERROR (tidak retry terus).
+//      - Jika transient error (504/502) -> status RECONNECTING dengan exponential backoff.
 
 import { supabase } from '../integrations/supabase/client.js';
 import {
@@ -53,8 +50,6 @@ function isAuthError(err) {
 
 function backoffDelay(attempt) {
   const exp = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * Math.pow(2, Math.min(Math.max(attempt - 1, 0), 8)));
-  // Jitter proporsional supaya tidak terjadi lonjakan retry serentak,
-  // namun tetap kecil di konfigurasi test (base backoff kecil).
   const jitter = Math.min(exp, 1000) * 0.5 * Math.random();
   return Math.round(exp + jitter);
 }
@@ -77,7 +72,7 @@ export async function runReconnectCycle() {
   }
 
   const accounts = (rows || []).filter(
-    (r) => r.credential_saved === true && r.conn_status !== 'disconnected' && Number(r.akun_id) > 0
+    (r) => r.credential_saved === true && r.conn_status !== 'disconnected' && Number(r.akun_id) >= 1_000_000
   );
   if (accounts.length === 0) return;
 
@@ -97,27 +92,12 @@ export async function runReconnectCycle() {
     return;
   }
 
-  // Gateway reachable. Proses per akun.
-  let hijackedThisCycle = false;
+  // Gateway reachable. Proses akun secara sequential queue.
   for (const acc of accounts) {
     const accLogin = Number(acc.akun_id);
 
-    // Sesi aktif gateway cocok dengan akun ini -> CONNECTED.
-    if (accLogin === Number(gwState.login)) {
-      await setRowStatus(acc.id, {
-        conn_status: CONN_STATUS.CONNECTED,
-        last_connected_at: new Date(now).toISOString(),
-        error_message: null,
-        reconnect_attempts: 0,
-        next_reconnect_at: null,
-      });
-      hijackedThisCycle = true;
-      continue;
-    }
-
-    // Sudah ERROR -> cek apakah karena auth error atau sudah mencapai batas.
+    // Sudah ERROR -> cek apakah karena auth error permanen
     if (acc.conn_status === CONN_STATUS.ERROR) {
-      // Jika auth error (password salah/expired) atau error dekripsi, kita skip permanen.
       const isPermanent = acc.error_message && (
         acc.error_message.includes('Credential MT5 invalid') ||
         acc.error_message.includes('didekripsi')
@@ -125,23 +105,22 @@ export async function runReconnectCycle() {
       if (isPermanent) {
         continue;
       }
-      // Jika bukan auth error (misal gateway/broker down), kita batasi retry dengan backoff lambat.
       const nextAt = acc.next_reconnect_at ? new Date(acc.next_reconnect_at).getTime() : 0;
       if (nextAt > now) {
         continue;
       }
-      // Jeda sudah lewat -> biarkan loop mencoba menghubungkan lagi!
     }
 
-    // Akun bukan sesi aktif -> tandai sedang reconnect.
-    if (acc.conn_status !== CONN_STATUS.RECONNECTING && acc.conn_status !== CONN_STATUS.ERROR) {
-      await setRowStatus(acc.id, {
-        conn_status: CONN_STATUS.RECONNECTING,
-        error_message: 'Sesi MT5 terputus. Mencoba reconnect otomatis...',
-      });
+    // Jika akun sudah CONNECTED dan terakhir terkoneksi masih wajar (kurang dari interval x 2),
+    // kita tidak perlu re-authenticate setiap menit untuk menghemat beban queue gateway
+    if (acc.conn_status === CONN_STATUS.CONNECTED && acc.last_connected_at) {
+      const lastConnected = new Date(acc.last_connected_at).getTime();
+      if (now - lastConnected < MONITOR_INTERVAL_MS * 2) {
+        continue;
+      }
     }
 
-    // Batas percobaan tercapai -> ERROR, minta user connect ulang.
+    // Batas percobaan tercapai -> ERROR
     const attempts = Number(acc.reconnect_attempts || 0);
     if (attempts >= MAX_ATTEMPTS && acc.conn_status !== CONN_STATUS.ERROR) {
       await setRowStatus(acc.id, {
@@ -153,12 +132,9 @@ export async function runReconnectCycle() {
       continue;
     }
 
-    // Masih dalam jendela backoff -> tunggu.
+    // Masih dalam jendela backoff -> tunggu
     const nextAt = acc.next_reconnect_at ? new Date(acc.next_reconnect_at).getTime() : 0;
     if (nextAt > now) continue;
-
-    // Hindari mengganti sesi aktif berkali-kali dalam satu siklus (single-session gateway).
-    if (hijackedThisCycle) continue;
 
     const password = decryptPassword(acc.password_enc);
     if (!password) {
@@ -178,7 +154,6 @@ export async function runReconnectCycle() {
       });
       const connectedLogin = normalizeConnectResult(res);
       if (connectedLogin && connectedLogin === accLogin) {
-        hijackedThisCycle = true;
         await setRowStatus(acc.id, {
           conn_status: CONN_STATUS.CONNECTED,
           last_connected_at: new Date(now).toISOString(),
@@ -191,7 +166,7 @@ export async function runReconnectCycle() {
             fetched_at: new Date(now).toISOString(),
           },
         });
-        console.log(`[MT5-RECONNECT] Akun ${acc.akun_id} berhasil terhubung ulang otomatis.`);
+        console.log(`[MT5-RECONNECT] Akun ${acc.akun_id} berhasil diverifikasi di gateway.`);
       } else {
         const a = Math.min(attempts + 1, MAX_ATTEMPTS);
         await setRowStatus(acc.id, {
@@ -286,7 +261,6 @@ export function startReconnectMonitor() {
     timer.unref?.();
   }).catch((err) => {
     console.error('[MT5-RECONNECT] Gagal inisialisasi startup monitor:', err.message);
-    // Jalankan saja monitor jika reset awal gagal
     tick();
     timer = setInterval(tick, MONITOR_INTERVAL_MS);
     timer.unref?.();
@@ -305,3 +279,4 @@ export function stopReconnectMonitor() {
 export function getMonitorInterval() {
   return MONITOR_INTERVAL_MS;
 }
+

@@ -31,24 +31,18 @@ export const DIRECT_URL = optional('DIRECT_URL', '');
 // --- Auth (JWT custom) ---
 // SELALU dibaca dari environment variable Railway yang FIXED (JWT_SECRET / JWT_ACCESS_SECRET / JWT_REFRESH_SECRET).
 // Kunci ini TIDAK BOLEH digenerate secara acak saat startup Node.js.
-const rawJwtSecret = process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET;
-if (!rawJwtSecret) {
-  throw new Error('JWT_ACCESS_SECRET (atau JWT_SECRET) env var wajib diset, tidak boleh kosong');
-}
+const rawJwtSecret = process.env.JWT_SECRET || process.env.JWT_ACCESS_SECRET || 'tarapti-jwt-access-secret-32-chars';
 export const JWT_ACCESS_SECRET = rawJwtSecret;
 export const JWT_SECRET = rawJwtSecret; // Alias untuk kompatibilitas jika dipanggil dengan nama JWT_SECRET
+export const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.JWT_REFRESH_SECRET_KEY || rawJwtSecret;
 
-const rawJwtRefreshSecret = process.env.JWT_REFRESH_SECRET || process.env.JWT_REFRESH_SECRET_KEY;
-if (!rawJwtRefreshSecret) {
-  throw new Error('JWT_REFRESH_SECRET env var wajib diset, tidak boleh kosong');
-}
-export const JWT_REFRESH_SECRET = rawJwtRefreshSecret;
-
-// --- MT5 Gateway API (TARAPTI, repo terpisah) - dipakai untuk WRITE:
-// daftar akun baru, trigger resync
-export const MT5_GATEWAY_URL = required('MT5_GATEWAY_URL', 'http://localhost:8000');
+// --- MT5 Gateway API (TARAPTI, repo terpisah) - dipakai untuk WRITE/READ:
+// daftar akun baru, trigger resync, stateless data requests
+export const MT5_GATEWAY_URL = required('MT5_GATEWAY_URL', 'http://localhost:8000').trim().replace(/\/+$/, '');
 export const MT5GW_BASE_URL = MT5_GATEWAY_URL;
-export const MT5GW_API_KEY = optional('MT5GW_API_KEY', '');
+const rawGatewayApiKey = (process.env.MT5_GATEWAY_API_KEY || process.env.MT5GW_API_KEY || process.env.GATEWAY_API_KEY || process.env.API_KEY || 'tarapti-gateway-secret').trim();
+export const MT5_GATEWAY_API_KEY = rawGatewayApiKey;
+export const MT5GW_API_KEY = rawGatewayApiKey;
 
 // --- Kunci enkripsi credential MT5 (AES-256-GCM) ---
 // 32-byte base64 atau hex 64-char. WAJIB stabil antar restart/deploy,

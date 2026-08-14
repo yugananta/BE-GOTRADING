@@ -1,29 +1,21 @@
 // server/integrations/mt5-gateway/client.js
 //
-// Client tipis untuk manggil TARAPTI MT5 Gateway API (app.py, repo terpisah
-// tarapti-mt5-gateway). Gateway live saat ini adalah jembatan SATU sesi MT5
-// (satu akun broker yang terhubung di VPS) dan expose endpoint sebagai
-// berikut (diverifikasi via GET /openapi.json, gateway v0.1.0):
+// Client untuk TARAPTI MT5 Gateway API (stateless, sequential queue).
+// Semua endpoint data query menggunakan metode POST dengan body JSON
+// kredensial { login, password, server, broker } dan header X-API-Key.
 //
-//   GET /account                       -> profil + balance/equity/margin akun
-//   GET /positions                     -> posisi terbuka
-//   GET /orders                        -> order pending
-//   GET /trades                        -> riwayat trade (open + closed)
-//   GET /deals                         -> riwayat deal lengkap (dengan waktu)
-//   GET /symbol/{symbol}               -> quote bid/ask sebuah simbol
-//   POST /order                        -> buka order (BELUM dipakai)
-//   POST /close/{ticket}               -> tutup posisi (BELUM dipakai)
-//
-// CATATAN INTEGRASI (hasil audit):
-//   - Gateway TIDAK punya endpoint /accounts, /accounts/{id}/status, maupun
-//     /accounts/{id}/resync. Endpoint resync TIDAK ada -> JANGAN manggilnya.
-//     "Refresh/sync" di sisi backend cukup dengan memanggil ulang GET /account
-//     dan GET /trades (data gateway selalu real-time dari terminal MT5).
-//   - Gateway live TIDAK memakai x-api-key (openapi tanpa security scheme).
-//     Header tetap dikirim kalau MT5GW_API_KEY diisi, untuk kompatibilitas
-//     bila di depan gateway ada proxy yang mewajibkannya.
+// Endpoint yang didukung:
+//   POST /connect                      -> verifikasi login / connect akun MT5
+//   POST /account                      -> profil + balance/equity/margin akun
+//   POST /positions                    -> posisi terbuka akun
+//   POST /orders                       -> order pending akun
+//   POST /trades                       -> riwayat trade (open + closed)
+//   POST /deals                        -> riwayat deal lengkap (dengan waktu)
+//   POST /symbol/{symbol}              -> quote bid/ask sebuah simbol
+//   POST /disconnect                   -> lepas sesi (opsional)
+//   GET  /health                       -> probe liveness gateway
 
-import { MT5_GATEWAY_URL, MT5GW_API_KEY } from '../../config/env.js';
+import { MT5_GATEWAY_URL, MT5_GATEWAY_API_KEY, MT5GW_API_KEY } from '../../config/env.js';
 import {
   SYNC_DURATION,
   SYNC_SUCCESS_TOTAL,
@@ -40,7 +32,24 @@ export class MT5GatewayError extends Error {
   }
 }
 
-async function request(path, { method = 'GET', body, timeout = 15000 } = {}) {
+export function formatCredentialsBody(credentials, additional = {}) {
+  if (!credentials) return additional;
+  const rawLogin = credentials.login ?? credentials.akun_id ?? credentials.akunId;
+  const cleanLogin = rawLogin != null ? parseInt(String(rawLogin).trim(), 10) : undefined;
+  const plainPassword = String(credentials.password ?? credentials.password_investor ?? credentials.passwordInvestor ?? '');
+  const cleanServer = String(credentials.server ?? '').trim();
+  const cleanBroker = String(credentials.broker ?? '').trim() || (cleanServer ? cleanServer.split('-')[0] : 'Axi');
+  return {
+    login: cleanLogin,
+    password: plainPassword,
+    password_investor: plainPassword,
+    server: cleanServer,
+    broker: cleanBroker,
+    ...additional,
+  };
+}
+
+async function request(path, { method = 'POST', body, timeout = 30000 } = {}) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
   const startedAt = process.hrtime.bigint();
@@ -52,31 +61,53 @@ async function request(path, { method = 'GET', body, timeout = 15000 } = {}) {
   };
 
   const recordSyncError = (errorType) => {
-    if (method === 'POST' || method === 'GET') {
-      SYNC_ERRORS_TOTAL.labels({ error_type: errorType }).inc();
-    }
+    SYNC_ERRORS_TOTAL.labels({ error_type: errorType }).inc();
   };
 
   try {
     const headers = { 'Content-Type': 'application/json' };
-    if (MT5GW_API_KEY) headers['x-api-key'] = MT5GW_API_KEY;
+    const apiKey = (MT5_GATEWAY_API_KEY || MT5GW_API_KEY || '').trim();
+    if (apiKey) {
+      headers['X-API-Key'] = apiKey;
+      headers['x-api-key'] = apiKey;
+      headers['api-key'] = apiKey;
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
 
     const res = await fetch(`${MT5_GATEWAY_URL}${path}`, {
       method,
       headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal
+      body: body ? JSON.stringify(body) : (method === 'POST' ? '{}' : undefined),
+      signal: controller.signal,
     });
     clearTimeout(id);
 
     const text = await res.text();
-    const data = text ? JSON.parse(text) : null;
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { raw: text };
+    }
 
     if (!res.ok) {
       recordDuration();
       recordSyncError(`http_${res.status}`);
+
+      if (res.status === 401) {
+        console.error(`[MT5-GATEWAY] 401 Unauthorized on ${method} ${path}. Mohon pastikan MT5_GATEWAY_API_KEY di backend persis sama dengan .env di gateway VPS.`);
+      }
+
+      if (res.status === 504) {
+        const timeoutErr = new Error('Gateway sedang sibuk, coba lagi sebentar');
+        timeoutErr.status = 504;
+        timeoutErr.body = data;
+        throw timeoutErr;
+      }
+
+      const detailMsg = data?.detail || data?.message || data?.error || `MT5 Gateway error (HTTP ${res.status})`;
       throw new MT5GatewayError(
-        data?.detail || `MT5 Gateway error (HTTP ${res.status})`,
+        detailMsg,
         res.status,
         data
       );
@@ -86,10 +117,10 @@ async function request(path, { method = 'GET', body, timeout = 15000 } = {}) {
     return data;
   } catch (err) {
     clearTimeout(id);
-    if (err.name === 'AbortError') {
+    if (err.name === 'AbortError' || err.status === 504) {
       recordDuration();
       recordSyncError('gateway_timeout');
-      const timeoutErr = new Error('Koneksi ke MT5 Gateway timeout');
+      const timeoutErr = new Error('Gateway sedang sibuk, coba lagi sebentar');
       timeoutErr.status = 504;
       throw timeoutErr;
     }
@@ -104,98 +135,124 @@ async function request(path, { method = 'GET', body, timeout = 15000 } = {}) {
   }
 }
 
-// Sesuai GET /account di app.py (profil + balance akun sesi gateway)
-export function getAccount(timeout = 15000) {
-  return request('/account', { timeout });
+// POST /account (profil + balance/equity akun via kredensial)
+export function getAccount(credentials) {
+  return request('/account', {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+  });
 }
 
-// Sesuai GET /positions di app.py
-export function getPositions() {
-  return request('/positions');
+// POST /positions (posisi terbuka akun via kredensial)
+export function getPositions(credentials) {
+  return request('/positions', {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+  });
 }
 
-// Sesuai GET /orders di app.py
-export function getOrders() {
-  return request('/orders');
+// POST /orders (pending orders via kredensial)
+export function getOrders(credentials) {
+  return request('/orders', {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+  });
 }
 
-// Sesuai GET /trades di app.py (riwayat trade, open + closed)
-export function getTrades() {
-  return request('/trades');
+// POST /trades (riwayat trade, open + closed via kredensial)
+export function getTrades(credentials) {
+  return request('/trades', {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+  });
 }
 
-// Sesuai GET /deals di app.py (riwayat deal, berisi waktu eksekusi)
-export function getDeals() {
-  return request('/deals');
+// POST /deals (riwayat deal, berisi waktu eksekusi via kredensial)
+export function getDeals(credentials) {
+  return request('/deals', {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+  });
 }
 
-// Sesuai GET /symbol/{symbol} di app.py
-export function getSymbol(symbol) {
-  return request(`/symbol/${encodeURIComponent(symbol)}`);
+// POST /symbol/{symbol}
+export function getSymbol(symbol, credentials) {
+  return request(`/symbol/${encodeURIComponent(symbol)}`, {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+  });
 }
 
-// ---------------------------------------------------------------------------
-// MT5 PERSISTENCE & AUTO-RECONNECT
-// ---------------------------------------------------------------------------
-// Endpoint berikut TIDAK boleh dipanggil langsung oleh Frontend. Dipakai
-// oleh backend untuk mendeteksi koneksi terputus dan memaksa gateway
-// reconnect memakai credential yang tersimpan di database.
-//
-// Endpoint /connect & /disconnect di gateway diimplementasikan lewat
-// GATEWAY_ADDENDUM_reconnect.py (lihat file tersebut).
-
-// Probe ringan kondisi koneksi gateway. TIDAK pernah throw: kembalikan
-// { reachable, login, account, error } supaya pemanggil bisa memutuskan
-// status CONNECTED / RECONNECTING / DISCONNECTED / ERROR.
-export async function getGatewayState() {
+// Probe ringan liveness gateway (POST /health dengan fallback GET)
+export async function getGatewayHealth() {
   try {
-    const account = await getAccount(3000);
+    return await request('/health', { method: 'POST', body: {}, timeout: 5000 });
+  } catch (err) {
+    if (err.status === 405) {
+      return await request('/health', { method: 'GET', timeout: 5000 });
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MT5 PERSISTENCE & AUTO-RECONNECT (STATELESS MODEL)
+// ---------------------------------------------------------------------------
+
+// Probe status koneksi gateway untuk akun tertentu (atau health jika tanpa credentials).
+export async function getGatewayState(credentials = null) {
+  try {
+    if (credentials) {
+      const account = await getAccount(credentials);
+      return {
+        reachable: true,
+        login: account && account.login != null ? Number(account.login) : Number(credentials.login || credentials.akun_id),
+        account,
+        error: null,
+      };
+    }
+    const health = await getGatewayHealth();
     return {
       reachable: true,
-      login: account && account.login != null ? Number(account.login) : null,
-      account,
+      login: null,
+      account: health,
       error: null,
     };
   } catch (err) {
-    if (err instanceof MT5GatewayError) {
-      return { reachable: true, login: null, account: null, error: err };
-    }
     return { reachable: false, login: null, account: null, error: err };
   }
 }
 
-// Perintahkan gateway untuk login/reconnect ke akun MT5 tertentu.
-// Body mengikuti GATEWAY_ADDENDUM_reconnect.py. Timeout lebih panjang
-// karena login MT5 bisa memakan waktu.
+// Perintahkan gateway untuk login/verifikasi akun MT5 tertentu.
 export async function gatewayConnect({ login, server, password, broker }) {
   return request('/connect', {
     method: 'POST',
-    body: {
-      login: parseInt(login, 10),
-      password: password,
-      password_investor: password,
-      server: server,
-      broker: broker || (server ? server.split('-')[0] : 'Axi'),
-    },
+    body: formatCredentialsBody({ login, server, password, broker }),
     timeout: 30000,
   });
 }
 
-// Perintahkan gateway melepas sesi MT5 yang aktif (dipakai saat user
-// sengaja disconnect).
-export async function gatewayDisconnect() {
-  return request('/disconnect', { method: 'POST', timeout: 15000 });
+// Perintahkan gateway melepas sesi MT5 jika diperlukan.
+export async function gatewayDisconnect(credentials = null) {
+  return request('/disconnect', {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+    timeout: 15000,
+  });
 }
 
-// Perintahkan gateway untuk memaksa status akun 'pending' di fetch_queue.
-export async function gatewayResync(akunId) {
-  return request(`/accounts/${Number(akunId)}/resync`, { method: 'POST', timeout: 15000 });
+// Perintahkan gateway untuk trigger resync.
+export async function gatewayResync(akunId, credentials = null) {
+  return request(`/accounts/${Number(akunId)}/resync`, {
+    method: 'POST',
+    body: formatCredentialsBody(credentials),
+    timeout: 15000,
+  });
 }
 
-// Normalisasi respons /connect dari berbagai bentuk (addendum yang
-// menyesuaikan versi gateway). Mengembalikan login akun yang aktif, atau null.
+// Normalisasi respons /connect atau /account dari gateway.
 export function normalizeConnectResult(res) {
   if (!res) return null;
-  const login = res.login ?? res.account?.login ?? res.akun_id ?? null;
+  const login = res.login ?? res.account?.login ?? res.akun_id ?? res.user_id ?? null;
   return login != null ? Number(login) : null;
 }

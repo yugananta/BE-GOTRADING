@@ -4,36 +4,15 @@
 // AppContext.tsx: fetchMetaTraderData, syncMetaTrader, connectBroker,
 // disconnectBroker.
 //
-// ARSITEKTUR (hasil audit integrasi MT5):
-//   - MT5 Gateway (app.py) adalah jembatan SATU sesi: satu akun broker yang
-//     terhubung di VPS. Data account/positions/trades/orders diambil langsung
-//     dan real-time dari gateway (GET /account, GET /trades, dst).
-//     >> CATATAN PENTING: karena gateway cuma 1 sesi, hanya SATU akun MT5
-//        yang bisa 'live' di satu waktu untuk seluruh sistem. Akun lain akan
-//        tetap dalam status 'reconnecting' sampai gateway di-upgrade untuk
-//        mendukung multi-session, atau sampai user tersebut yang aktif di
-//        gateway.
-//   - Supabase `user_mt5_accounts` menyimpan tautan:
-//     user_id + akun_id -> snapshot data MT5 + CREDENTIAL TERENKRIPSI
-//     (password_enc) supaya sistem bisa auto-reconnect tanpa meminta user
-//     login ulang saat backend/MT5 Gateway restart.
-//   - PERSYARATAN BISNIS TARAPTI:
-//     1. 1 Profile boleh memiliki banyak akun MT5 (1 user -> N akun_id).
-//     2. 1 Akun MT5 TIDAK boleh dimiliki banyak profile (akun_id UNIQUE secara global).
-//     3. Riwayat transaksi & report bersifat PER AKUN (tidak diakumulasi antar akun).
-//
-// DB CONSTRAINT YANG DIBUTUHKAN (lihat migration 01_fix_multi_account_constraint.sql):
-//   - UNIQUE(user_id, akun_id)  -> user boleh punya banyak baris/akun
-//   - UNIQUE(akun_id)           -> 1 akun MT5 cuma boleh dimiliki 1 user manapun
-//
-// MT5 PERSISTENCE & AUTO-RECONNECT:
-//   - connectMyAccount: simpan credential (login + password investor + server)
-//     secara TERENKRIPSI di database, lalu verifikasi/terhubungkan ke gateway.
-//     Kalau gateway sedang tidak bisa dihubungi, akun tetap tersimpan dengan
-//     conn_status = 'reconnecting' dan monitor auto-reconnect akan menyambungkan.
-//   - Credential TIDAK pernah dikirim kembali ke Frontend dan TIDAK pernah
-//     ditulis di log.
-//   - Status koneksi: 'connected' | 'reconnecting' | 'disconnected' | 'error'.
+// ARSITEKTUR MT5 GATEWAY STATELESS (sequential queue):
+//   - MT5 Gateway (Python) beroperasi secara STATELESS dengan antrean sekuensial.
+//     Setiap request data (/account, /trades, /positions, /deals, /orders)
+//     menerima kredensial terdekripsi { login, password, server, broker }
+//     melalui method POST dan header X-API-Key.
+//   - Supabase `user_mt5_accounts` menyimpan data akun & password investor
+//     terenkripsi (password_enc) menggunakan AES-256.
+//   - Tidak ada lagi keterbatasan 1 sesi untuk seluruh sistem: setiap akun MT5
+//     milik setiap user dapat diakses dan berstatus CONNECTED secara mandiri.
 
 import { supabase } from '../integrations/supabase/client.js';
 import {
@@ -61,9 +40,30 @@ export const CONN_STATUS = {
 
 function isAuthError(err) {
   if (!err) return false;
-  if (err.status === 401) return true;
-  const msg = String(err.message || err.body?.detail || '').toLowerCase();
-  return /invalid_user_or_password|invalid login|invalid password|wrong password|invalid credential|authentication failed|auth_failed|authorization/i.test(msg);
+  if (err.status === 400 || err.status === 401 || err.status === 422 || err.status === 502) {
+    const msg = String(err.message || err.body?.detail || err.body?.error || '').toLowerCase();
+    return /invalid_user_or_password|invalid login|invalid password|wrong password|invalid credential|authentication failed|auth_failed|authorization|login failed|password incorrect/i.test(msg);
+  }
+  return false;
+}
+
+export function getAccountCredentials(row, plainPassword = null) {
+  if (!row) return null;
+  let password = plainPassword;
+  if (!password && row.password_enc) {
+    try {
+      password = decryptPassword(row.password_enc);
+    } catch (e) {
+      console.warn('[MT5] Gagal mendekripsi password_enc untuk akun', row.akun_id, e.message);
+    }
+  }
+  if (!password) return null;
+  return {
+    login: Number(row.akun_id),
+    password,
+    server: row.server || row.snapshot?.requested_server || 'Axi-US50-Demo',
+    broker: row.broker || row.snapshot?.requested_broker || 'Axi',
+  };
 }
 
 async function getMyAkunRow(userId, akunId = null) {
@@ -165,49 +165,53 @@ export async function getMyAccount(userId, akunId = null) {
 
   let gw = null;
   let live = false;
-  try {
-    const liveGw = await getAccount(3000);
-    if (liveGw && Number(liveGw.login) === Number(row.akun_id)) {
-      gw = liveGw;
-      live = true;
-    }
-  } catch (err) {
-    console.warn('[MT5] Gateway getAccount failed, using saved snapshot:', err.message);
-  }
+  let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
+  const creds = getAccountCredentials(row);
 
-  // Jika gateway belum terhubung ke akun ini, tapi credential tersimpan -> coba reconnect proaktif
-  if (!live && row.credential_saved && row.conn_status !== CONN_STATUS.DISCONNECTED && row.conn_status !== CONN_STATUS.ERROR && row.password_enc) {
+  if (creds && row.credential_saved && connStatus !== CONN_STATUS.DISCONNECTED) {
     try {
-      const password = decryptPassword(row.password_enc);
-      if (password) {
-        const connectRes = await gatewayConnect({
-          login: String(row.akun_id),
-          server: row.server,
-          password,
-          broker: row.broker,
-        });
-        const connectedLogin = normalizeConnectResult(connectRes);
-        if (connectedLogin && connectedLogin === Number(row.akun_id)) {
-          gw = connectRes?.account || connectRes;
-          live = true;
-          row.conn_status = CONN_STATUS.CONNECTED;
-          supabase
-            .from('user_mt5_accounts')
-            .update({
-              conn_status: CONN_STATUS.CONNECTED,
-              status: 'connected',
-              last_connected_at: new Date().toISOString(),
-              error_message: null,
-              reconnect_attempts: 0,
-              next_reconnect_at: null,
-            })
-            .eq('id', row.id)
-            .then(() => {})
-            .catch(() => {});
-        }
+      const liveGw = await getAccount(creds);
+      if (liveGw && (liveGw.login != null || liveGw.balance !== undefined)) {
+        gw = liveGw;
+        live = true;
+        connStatus = CONN_STATUS.CONNECTED;
+
+        supabase
+          .from('user_mt5_accounts')
+          .update({
+            conn_status: CONN_STATUS.CONNECTED,
+            status: 'connected',
+            last_connected_at: new Date().toISOString(),
+            error_message: null,
+            reconnect_attempts: 0,
+            next_reconnect_at: null,
+            snapshot: {
+              ...row.snapshot,
+              account: gw,
+              fetched_at: new Date().toISOString(),
+            },
+          })
+          .eq('id', row.id)
+          .then(() => {})
+          .catch(() => {});
       }
-    } catch (e) {
-      console.warn('[MT5] On-demand reconnect in getMyAccount failed:', e.message);
+    } catch (err) {
+      console.warn('[MT5] getAccount failed in getMyAccount:', err.message);
+      if (isAuthError(err)) {
+        connStatus = CONN_STATUS.ERROR;
+        supabase
+          .from('user_mt5_accounts')
+          .update({
+            conn_status: CONN_STATUS.ERROR,
+            error_message: err.message || 'Credential MT5 invalid atau kedaluwarsa',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', row.id)
+          .then(() => {})
+          .catch(() => {});
+      } else if (err.status === 504 || err.status === 503) {
+        connStatus = CONN_STATUS.RECONNECTING;
+      }
     }
   }
 
@@ -222,20 +226,10 @@ export async function getMyAccount(userId, akunId = null) {
     margin_free: 0,
     margin_level: 0,
     currency: 'USD',
-    leverage: 100
+    leverage: 100,
   };
 
-  // Hanya promosikan ke 'connected' bila gateway benar-benar login di akun ini.
-  let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
-  if (live && connStatus !== CONN_STATUS.ERROR) {
-    connStatus = CONN_STATUS.CONNECTED;
-  } else if (!live && connStatus === CONN_STATUS.CONNECTED && row.credential_saved) {
-    // Tautan masih ada tapi gateway tidak lagi di akun ini -> sedang reconnect
-    connStatus = CONN_STATUS.RECONNECTING;
-  }
-
   const mapped = mapGatewayAccount(gw || fallback, { ...row, conn_status: connStatus });
-
   return { account: mapped, live };
 }
 
@@ -246,20 +240,20 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
   const limitNum = Number(limit) || 200;
   let gwTrades = null;
   let gwDeals = [];
+  const creds = getAccountCredentials(row);
 
-  try {
-    const gw = await getAccount(3000);
-    // Live trades hanya diambil jika gateway sedang terhubung ke akun_id yang tepat!
-    if (gw && Number(gw.login) === Number(row.akun_id)) {
-      gwTrades = await getTrades();
+  if (creds && row.credential_saved) {
+    try {
+      gwTrades = await getTrades(creds);
       try {
-        gwDeals = (await getDeals()).deals || [];
+        const dealsRes = await getDeals(creds);
+        gwDeals = dealsRes?.deals || [];
       } catch (err) {
         console.warn('[MT5] Gagal ambil /deals, lanjut tanpa timeline:', err.message);
       }
+    } catch (err) {
+      console.warn('[MT5] Gagal ambil trades dari gateway, fallback ke snapshot:', err.message);
     }
-  } catch (err) {
-    console.warn('[MT5] Gagal ambil trades dari gateway, fallback ke snapshot:', err.message);
   }
 
   if (gwTrades && gwTrades.trades) {
@@ -282,7 +276,6 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
       };
     });
 
-    // Update snapshot trades secara terisolasi untuk akun ini
     supabase
       .from('user_mt5_accounts')
       .update({
@@ -290,7 +283,7 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
           ...row.snapshot,
           trades,
           fetched_at: new Date().toISOString(),
-        }
+        },
       })
       .eq('id', row.id)
       .then(() => {})
@@ -299,7 +292,6 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
     return { trades };
   }
 
-  // Fallback: Kembalikan trades murni khusus dari snapshot akun ini (TIDAK dicampur dengan akun lain)
   const snapshotTrades = row.snapshot?.trades || [];
   return { trades: snapshotTrades.slice(0, limitNum) };
 }
@@ -385,73 +377,62 @@ export async function connectMyAccount(userId, { platform, login, password, serv
   const cleanBroker = (broker || '').trim() || (cleanServer ? cleanServer.split('-')[0] : null) || 'Axi';
   const passwordEnc = encryptPassword(password);
 
-  // --- Coba hubungkan/verifikasi ke gateway (best-effort, tidak memblokir) ---
-  // Kalau gateway tidak bisa dihubungi sekarang, credential tetap disimpan
-  // dan monitor auto-reconnect akan menyambungkan kemudian.
-  let gwState = { reachable: false, login: null, account: null, error: null };
-  try {
-    gwState = await getGatewayState();
-  } catch (err) {
-    console.warn('[MT5] getGatewayState gagal saat connect:', err.message);
-  }
+  const credentials = {
+    login: akunId,
+    password,
+    server: cleanServer,
+    broker: cleanBroker,
+  };
 
   let connStatus = CONN_STATUS.RECONNECTING;
   let errorMessage = null;
-  let gwAccount = gwState.account || null;
+  let gwAccount = null;
   let initialTrades = [];
   let initialDeals = [];
+  let initialPositions = [];
 
-  if (gwState.reachable && Number(gwState.login) === akunId) {
-    connStatus = CONN_STATUS.CONNECTED;
-    try {
-      const tRes = await getTrades();
-      initialTrades = tRes?.trades || [];
+  try {
+    const connectRes = await gatewayConnect(credentials);
+    const connectedLogin = normalizeConnectResult(connectRes);
+    if (connectedLogin && connectedLogin === akunId) {
+      connStatus = CONN_STATUS.CONNECTED;
+      gwAccount = connectRes?.account || connectRes;
+
+      // Ambil data snapshot awal
       try {
-        const dRes = await getDeals();
-        initialDeals = dRes?.deals || [];
-      } catch (err) {}
-    } catch (e) {}
-  } else if (gwState.reachable || passwordEnc) {
-    // Gateway hidup tapi bukan di akun ini, atau kita punya credential -> coba connect
-    try {
-      const connectRes = await gatewayConnect({
-        login: String(akunId),
-        server: cleanServer,
-        password,
-        broker: cleanBroker,
-      });
-      const connectedLogin = normalizeConnectResult(connectRes);
-      if (connectedLogin && connectedLogin === akunId) {
-        connStatus = CONN_STATUS.CONNECTED;
-        gwAccount = connectRes?.account || connectRes || gwAccount;
-      } else {
-        connStatus = CONN_STATUS.RECONNECTING;
-        errorMessage = 'Koneksi diproses. Sistem akan otomatis terhubung.';
+        const [tRes, dRes, pRes] = await Promise.allSettled([
+          getTrades(credentials),
+          getDeals(credentials),
+          getPositions(credentials),
+        ]);
+        if (tRes.status === 'fulfilled' && tRes.value?.trades) {
+          initialTrades = tRes.value.trades;
+        }
+        if (dRes.status === 'fulfilled' && dRes.value?.deals) {
+          initialDeals = dRes.value.deals;
+        }
+        if (pRes.status === 'fulfilled') {
+          const rawPos = pRes.value?.positions || pRes.value?.data || (Array.isArray(pRes.value) ? pRes.value : []);
+          initialPositions = rawPos;
+        }
+      } catch (e) {
+        console.warn('[MT5] Gagal ambil initial snapshot saat connect:', e.message);
       }
-    } catch (err) {
-      console.error('[MT5-CONNECT-ERR] Gateway connect failed:', err.message, err.body || '');
-      if (isAuthError(err)) {
-        connStatus = CONN_STATUS.ERROR;
-        errorMessage = err.body?.detail || err.message || 'Credential MT5 invalid atau sudah kedaluwarsa. Silakan periksa kembali dan hubungkan ulang.';
-      } else {
-        connStatus = CONN_STATUS.RECONNECTING;
-        errorMessage = gwState.reachable
-          ? (err.body?.detail || err.message || 'Gagal terhubung sekarang. Sistem akan mencoba lagi secara otomatis.')
-          : GATEWAY_UNAVAILABLE_MSG;
-      }
+    } else {
+      connStatus = CONN_STATUS.RECONNECTING;
+      errorMessage = 'Koneksi sedang diproses di antrean gateway.';
     }
-  }
-
-  // Ambil trades khusus untuk akun ini jika gateway sedang login di akun_id tersebut
-  if (connStatus === CONN_STATUS.CONNECTED && (!initialTrades || initialTrades.length === 0)) {
-    try {
-      const tRes = await getTrades();
-      initialTrades = tRes?.trades || [];
-      try {
-        const dRes = await getDeals();
-        initialDeals = dRes?.deals || [];
-      } catch (err) {}
-    } catch (e) {}
+  } catch (err) {
+    console.error('[MT5-CONNECT-ERR] Gateway connect failed:', err.message, err.body || '');
+    if (isAuthError(err)) {
+      connStatus = CONN_STATUS.ERROR;
+      errorMessage = err.body?.detail || err.message || 'Credential MT5 invalid atau sudah kedaluwarsa. Silakan periksa kembali dan hubungkan ulang.';
+    } else {
+      connStatus = CONN_STATUS.RECONNECTING;
+      errorMessage = err.status === 504
+        ? 'Gateway timeout saat memproses login. Akun disimpan dan akan dicoba kembali otomatis.'
+        : (err.body?.detail || err.message || GATEWAY_UNAVAILABLE_MSG);
+    }
   }
 
   // 1 Profile boleh memiliki BANYAK akun MT5. Cari row yang SAMA PERSIS
@@ -488,6 +469,21 @@ export async function connectMyAccount(userId, { platform, login, password, serv
     });
   }
 
+  const mappedPositions = initialPositions.map((p) => ({
+    ticket: String(p.ticket ?? p.id ?? ''),
+    symbol: p.symbol ?? '',
+    type: (p.type || p.side || '').toUpperCase(),
+    volume: parseFloat(p.volume || p.lots) || 0,
+    lots: parseFloat(p.volume || p.lots) || 0,
+    openPrice: parseFloat(p.open_price || p.price) || 0,
+    currentPrice: parseFloat(p.current_price || p.price_current) || 0,
+    sl: parseFloat(p.sl) || 0,
+    tp: parseFloat(p.tp) || 0,
+    profit: parseFloat(p.profit) || 0,
+    swap: parseFloat(p.swap) || 0,
+    comment: p.comment || '',
+  }));
+
   const nowIso = new Date().toISOString();
   const patch = {
     status: 'connected',
@@ -507,6 +503,7 @@ export async function connectMyAccount(userId, { platform, login, password, serv
     snapshot: {
       account: connStatus === CONN_STATUS.CONNECTED ? gwAccount : (isSameAccount ? (existingUserRow?.snapshot?.account || null) : null),
       trades: mappedTrades,
+      positions: mappedPositions.length > 0 ? mappedPositions : (isSameAccount ? (existingUserRow?.snapshot?.positions || []) : []),
       requested_login: String(akunId),
       requested_server: cleanServer,
       requested_broker: cleanBroker,
@@ -624,25 +621,32 @@ export async function syncMyAccount(userId, akunId = null) {
     throw err;
   }
 
+  const creds = getAccountCredentials(row);
   let gw = null;
   let gwTrades = null;
   let gwDeals = [];
   let live = false;
-  try {
-    gw = await getAccount(3000);
-    // PERMINTAAN KLIEN: Sync trades HANYA jika gateway terhubung pada akun_id yang sama!
-    if (gw && Number(gw.login) === Number(row.akun_id)) {
-      live = true;
-      gwTrades = await getTrades();
-      try {
-        const dRes = await getDeals();
-        gwDeals = dRes?.deals || [];
-      } catch (err) {
-        console.warn('[MT5] Gagal ambil /deals saat sync, lanjut tanpa timeline:', err.message);
+
+  if (creds && row.credential_saved) {
+    try {
+      gw = await getAccount(creds);
+      if (gw && (gw.login != null || gw.balance !== undefined)) {
+        live = true;
+        try {
+          gwTrades = await getTrades(creds);
+          try {
+            const dRes = await getDeals(creds);
+            gwDeals = dRes?.deals || [];
+          } catch (err) {
+            console.warn('[MT5] Gagal ambil /deals saat sync, lanjut tanpa timeline:', err.message);
+          }
+        } catch (err) {
+          console.warn('[MT5] Gagal ambil trades saat sync:', err.message);
+        }
       }
+    } catch (e) {
+      console.warn('[MT5] Gateway sync failed:', e.message);
     }
-  } catch (e) {
-    console.warn('[MT5] Gateway sync failed:', e.message);
   }
 
   let newTrades = row.snapshot?.trades || [];
@@ -712,26 +716,7 @@ export async function listMyAccounts(userId) {
 
   if (error) throw error;
 
-  let liveGw = null;
-  // gatewayReachable = true HANYA jika gateway berhasil merespons dengan data akun.
-  // Jika gateway throw error (IPC timeout, 503, dll), tetap gunakan conn_status dari DB
-  // dan jangan override ke reconnecting — watchdog yang akan menangani reconnect.
-  let gatewayReachable = false;
-  try {
-    liveGw = await getAccount(3000);
-    // getAccount() sukses = gateway reachable dan MT5 terminal aktif
-    gatewayReachable = !!(liveGw && liveGw.login != null);
-  } catch (err) {
-    console.warn('[MT5] Gateway getAccount failed in listMyAccounts (transient, ignoring):', err.message);
-    // Biarkan gatewayReachable = false — conn_status tidak akan di-override
-  }
-
-  let needsReconnect = false;
   const mapped = (rows || []).map((row) => {
-    const isLive = liveGw && Number(liveGw.login) === Number(row.akun_id);
-    if (gatewayReachable && !isLive && row.credential_saved && row.conn_status !== CONN_STATUS.DISCONNECTED && row.conn_status !== CONN_STATUS.ERROR) {
-      needsReconnect = true;
-    }
     const fallback = row.snapshot?.account || {
       login: row.akun_id,
       server: row.server || row.snapshot?.requested_server || 'Axi-US50-Demo',
@@ -743,29 +728,12 @@ export async function listMyAccounts(userId) {
       margin_free: 0,
       margin_level: 0,
       currency: 'USD',
-      leverage: 100
+      leverage: 100,
     };
 
-    let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
-    if (gatewayReachable) {
-      // Gateway berhasil diakses: override conn_status berdasarkan realitas live
-      if (isLive && connStatus !== CONN_STATUS.ERROR) {
-        connStatus = CONN_STATUS.CONNECTED;
-      } else if (!isLive && connStatus === CONN_STATUS.CONNECTED && row.credential_saved) {
-        // Gateway hidup tapi akun ini bukan sesi aktif — tandai reconnecting
-        connStatus = CONN_STATUS.RECONNECTING;
-      }
-    }
-    // Jika gatewayReachable = false (error sementara): biarkan conn_status dari DB apa adanya
-
-    return mapGatewayAccount(isLive ? liveGw : fallback, { ...row, conn_status: connStatus });
+    const connStatus = row.conn_status || (row.status === 'connected' ? CONN_STATUS.CONNECTED : CONN_STATUS.DISCONNECTED);
+    return mapGatewayAccount(row.snapshot?.account || fallback, { ...row, conn_status: connStatus });
   });
-
-  if (needsReconnect) {
-    import('./mt5ReconnectService.js').then(({ runReconnectCycle }) => {
-      runReconnectCycle().catch((err) => console.warn('[MT5] Background reconnect trigger error:', err.message));
-    }).catch(() => {});
-  }
 
   return { accounts: mapped };
 }
@@ -774,14 +742,15 @@ export async function listMyPositions(userId, { akunId = null } = {}) {
   const row = await getMyAkunRow(userId, akunId);
   if (!row) return { positions: [], count: 0 };
 
+  const creds = getAccountCredentials(row);
   let gwPositions = null;
-  try {
-    const gw = await getAccount(3000);
-    if (gw && Number(gw.login) === Number(row.akun_id)) {
-      gwPositions = await getPositions();
+
+  if (creds && row.credential_saved) {
+    try {
+      gwPositions = await getPositions(creds);
+    } catch (err) {
+      console.warn('[MT5] Gagal ambil positions dari gateway, fallback ke snapshot:', err.message);
     }
-  } catch (err) {
-    console.warn('[MT5] Gagal ambil positions dari gateway, fallback ke snapshot:', err.message);
   }
 
   if (gwPositions) {
@@ -808,7 +777,7 @@ export async function listMyPositions(userId, { akunId = null } = {}) {
           ...row.snapshot,
           positions,
           fetched_at: new Date().toISOString(),
-        }
+        },
       })
       .eq('id', row.id)
       .then(() => {})
@@ -826,14 +795,15 @@ export async function listMyDeals(userId, { limit = 200, akunId = null } = {}) {
   if (!row) return { deals: [], count: 0 };
 
   const limitNum = Number(limit) || 200;
+  const creds = getAccountCredentials(row);
   let gwDeals = null;
-  try {
-    const gw = await getAccount(3000);
-    if (gw && Number(gw.login) === Number(row.akun_id)) {
-      gwDeals = await getDeals();
+
+  if (creds && row.credential_saved) {
+    try {
+      gwDeals = await getDeals(creds);
+    } catch (err) {
+      console.warn('[MT5] Gagal ambil deals dari gateway, fallback ke snapshot:', err.message);
     }
-  } catch (err) {
-    console.warn('[MT5] Gagal ambil deals dari gateway, fallback ke snapshot:', err.message);
   }
 
   if (gwDeals) {
@@ -861,7 +831,7 @@ export async function listMyDeals(userId, { limit = 200, akunId = null } = {}) {
           ...row.snapshot,
           deals,
           fetched_at: new Date().toISOString(),
-        }
+        },
       })
       .eq('id', row.id)
       .then(() => {})
@@ -878,14 +848,15 @@ export async function listMyOrders(userId, { akunId = null } = {}) {
   const row = await getMyAkunRow(userId, akunId);
   if (!row) return { orders: [], count: 0 };
 
+  const creds = getAccountCredentials(row);
   let gwOrders = null;
-  try {
-    const gw = await getAccount(3000);
-    if (gw && Number(gw.login) === Number(row.akun_id)) {
-      gwOrders = await getOrders();
+
+  if (creds && row.credential_saved) {
+    try {
+      gwOrders = await getOrders(creds);
+    } catch (err) {
+      console.warn('[MT5] Gagal ambil orders dari gateway, fallback ke snapshot:', err.message);
     }
-  } catch (err) {
-    console.warn('[MT5] Gagal ambil orders dari gateway, fallback ke snapshot:', err.message);
   }
 
   if (gwOrders) {
@@ -909,7 +880,7 @@ export async function listMyOrders(userId, { akunId = null } = {}) {
           ...row.snapshot,
           orders,
           fetched_at: new Date().toISOString(),
-        }
+        },
       })
       .eq('id', row.id)
       .then(() => {})
