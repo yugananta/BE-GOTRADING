@@ -38,9 +38,24 @@ export const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.
 
 // --- MT5 Gateway API (TARAPTI, repo terpisah) - dipakai untuk WRITE/READ:
 // daftar akun baru, trigger resync, stateless data requests
-export const MT5_GATEWAY_URL = required('MT5_GATEWAY_URL', 'http://localhost:8000').trim().replace(/\/+$/, '');
-export const MT5GW_BASE_URL = MT5_GATEWAY_URL;
-const rawGatewayApiKey = (process.env.MT5_GATEWAY_API_KEY || process.env.MT5GW_API_KEY || process.env.GATEWAY_API_KEY || process.env.API_KEY || 'tarapti-gateway-secret').trim();
+const rawGatewayUrl = (
+  process.env.MT5_GATEWAY_URL ||
+  process.env.GATEWAY_URL ||
+  process.env.MT5GW_BASE_URL ||
+  process.env.MT5_GATEWAY_BASE_URL ||
+  process.env.MT5GW_URL ||
+  process.env.GATEWAY_BASE_URL ||
+  'http://localhost:8000'
+).trim().replace(/\/+$/, '');
+export const MT5_GATEWAY_URL = rawGatewayUrl;
+export const MT5GW_BASE_URL = rawGatewayUrl;
+const rawGatewayApiKey = (
+  process.env.MT5_GATEWAY_API_KEY ||
+  process.env.MT5GW_API_KEY ||
+  process.env.GATEWAY_API_KEY ||
+  process.env.API_KEY ||
+  'tarapti-gateway-secret'
+).trim();
 export const MT5_GATEWAY_API_KEY = rawGatewayApiKey;
 export const MT5GW_API_KEY = rawGatewayApiKey;
 
