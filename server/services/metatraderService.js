@@ -393,6 +393,7 @@ export async function connectMyAccount(userId, { platform, login, password, serv
 
   try {
     const connectRes = await gatewayConnect(credentials);
+    console.log('[GATEWAY-CALL] /connect response body:', JSON.stringify(connectRes));
     const connectedLogin = normalizeConnectResult(connectRes);
     if (connectedLogin && connectedLogin === akunId) {
       connStatus = CONN_STATUS.CONNECTED;
