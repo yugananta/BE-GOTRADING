@@ -74,12 +74,16 @@ async function request(path, { method = 'POST', body, timeout = 30000 } = {}) {
       headers['Authorization'] = `Bearer ${apiKey}`;
     }
 
-    const res = await fetch(`${MT5_GATEWAY_URL}${path}`, {
+    const url = `${MT5_GATEWAY_URL}${path}`;
+    console.log('[GATEWAY-CALL] About to fetch:', url, 'akunId:', body?.login, 'at', new Date().toISOString());
+
+    const res = await fetch(url, {
       method,
       headers,
       body: body ? JSON.stringify(body) : (method === 'POST' ? '{}' : undefined),
       signal: controller.signal,
     });
+    console.log('[GATEWAY-CALL] fetch finished, status:', res?.status);
     clearTimeout(id);
 
     const text = await res.text();
@@ -116,6 +120,7 @@ async function request(path, { method = 'POST', body, timeout = 30000 } = {}) {
     SYNC_SUCCESS_TOTAL.inc();
     return data;
   } catch (err) {
+    console.log('[GATEWAY-CALL] fetch threw:', err.message);
     clearTimeout(id);
     if (err.name === 'AbortError' || err.status === 504) {
       recordDuration();
