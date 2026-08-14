@@ -38,6 +38,53 @@ export const CONN_STATUS = {
   ERROR: 'error',
 };
 
+export function normalizeOrderType(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number') {
+    switch (val) {
+      case 0: return 'BUY';
+      case 1: return 'SELL';
+      case 2: return 'BUY_LIMIT';
+      case 3: return 'SELL_LIMIT';
+      case 4: return 'BUY_STOP';
+      case 5: return 'SELL_STOP';
+      case 6: return 'BUY_STOP_LIMIT';
+      case 7: return 'SELL_STOP_LIMIT';
+      default: return String(val).toUpperCase();
+    }
+  }
+  const str = String(val).trim().toUpperCase();
+  if (str === '0') return 'BUY';
+  if (str === '1') return 'SELL';
+  return str;
+}
+
+export function normalizePositionType(type, side) {
+  const val = type ?? side ?? '';
+  return normalizeOrderType(val);
+}
+
+export function normalizeDealType(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number') {
+    switch (val) {
+      case 0: return 'BUY';
+      case 1: return 'SELL';
+      case 2: return 'BALANCE';
+      case 3: return 'CREDIT';
+      case 4: return 'CHARGE';
+      case 5: return 'CORRECTION';
+      case 6: return 'BONUS';
+      case 7: return 'COMMISSION';
+      default: return String(val).toUpperCase();
+    }
+  }
+  const str = String(val).trim().toUpperCase();
+  if (str === '0') return 'BUY';
+  if (str === '1') return 'SELL';
+  return str;
+}
+
 function isAuthError(err) {
   if (!err) return false;
   if (err.status === 400 || err.status === 401 || err.status === 422 || err.status === 502) {
@@ -263,16 +310,16 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
       return {
         id: String(t.ticket ?? ''),
         symbol: t.symbol ?? '',
-        type: (t.side || '').toUpperCase(),
-        lots: parseFloat(t.volume) || 0,
-        openPrice: parseFloat(t.open_price) || 0,
-        closePrice: parseFloat(t.close_price) || 0,
+        type: normalizeOrderType(t.type ?? t.side),
+        lots: parseFloat(t.volume ?? t.lots) || 0,
+        openPrice: parseFloat(t.open_price ?? t.price) || 0,
+        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
         pl: parseFloat(t.profit) || 0,
         swap: parseFloat(t.swap) || 0,
         commission: parseFloat(t.commission) || 0,
         openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
         closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
-        status: (t.status || 'CLOSED').toUpperCase(),
+        status: String(t.status || 'CLOSED').toUpperCase(),
       };
     });
 
@@ -449,41 +496,49 @@ export async function connectMyAccount(userId, { platform, login, password, serv
   const isSameAccount = Boolean(existingUserRow);
 
   let mappedTrades = isSameAccount ? (existingUserRow?.snapshot?.trades || []) : [];
-  if (initialTrades.length > 0) {
-    const timeline = buildDealTimeline(initialDeals);
-    mappedTrades = initialTrades.map((t) => {
-      const tl = timeline[t.ticket] || {};
-      return {
-        id: String(t.ticket ?? ''),
-        symbol: t.symbol ?? '',
-        type: (t.side || '').toUpperCase(),
-        lots: parseFloat(t.volume) || 0,
-        openPrice: parseFloat(t.open_price) || 0,
-        closePrice: parseFloat(t.close_price) || 0,
-        pl: parseFloat(t.profit) || 0,
-        swap: parseFloat(t.swap) || 0,
-        commission: parseFloat(t.commission) || 0,
-        openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
-        closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
-        status: (t.status || 'CLOSED').toUpperCase(),
-      };
-    });
-  }
+  let mappedPositions = isSameAccount ? (existingUserRow?.snapshot?.positions || []) : [];
 
-  const mappedPositions = initialPositions.map((p) => ({
-    ticket: String(p.ticket ?? p.id ?? ''),
-    symbol: p.symbol ?? '',
-    type: (p.type || p.side || '').toUpperCase(),
-    volume: parseFloat(p.volume || p.lots) || 0,
-    lots: parseFloat(p.volume || p.lots) || 0,
-    openPrice: parseFloat(p.open_price || p.price) || 0,
-    currentPrice: parseFloat(p.current_price || p.price_current) || 0,
-    sl: parseFloat(p.sl) || 0,
-    tp: parseFloat(p.tp) || 0,
-    profit: parseFloat(p.profit) || 0,
-    swap: parseFloat(p.swap) || 0,
-    comment: p.comment || '',
-  }));
+  try {
+    if (initialTrades && initialTrades.length > 0) {
+      const timeline = buildDealTimeline(initialDeals);
+      mappedTrades = initialTrades.map((t) => {
+        const tl = timeline[t.ticket] || {};
+        return {
+          id: String(t.ticket ?? ''),
+          symbol: t.symbol ?? '',
+          type: normalizeOrderType(t.type ?? t.side),
+          lots: parseFloat(t.volume ?? t.lots) || 0,
+          openPrice: parseFloat(t.open_price ?? t.price) || 0,
+          closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
+          pl: parseFloat(t.profit) || 0,
+          swap: parseFloat(t.swap) || 0,
+          commission: parseFloat(t.commission) || 0,
+          openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
+          closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
+          status: String(t.status || 'CLOSED').toUpperCase(),
+        };
+      });
+    }
+
+    if (initialPositions && initialPositions.length > 0) {
+      mappedPositions = initialPositions.map((p) => ({
+        ticket: String(p.ticket ?? p.id ?? ''),
+        symbol: p.symbol ?? '',
+        type: normalizePositionType(p.type, p.side),
+        volume: parseFloat(p.volume ?? p.lots) || 0,
+        lots: parseFloat(p.volume ?? p.lots) || 0,
+        openPrice: parseFloat(p.open_price ?? p.price) || 0,
+        currentPrice: parseFloat(p.current_price ?? p.price_current) || 0,
+        sl: parseFloat(p.sl) || 0,
+        tp: parseFloat(p.tp) || 0,
+        profit: parseFloat(p.profit) || 0,
+        swap: parseFloat(p.swap) || 0,
+        comment: p.comment || '',
+      }));
+    }
+  } catch (snapErr) {
+    console.warn('[MT5] Gagal memproses format snapshot awal saat connect:', snapErr.message);
+  }
 
   const nowIso = new Date().toISOString();
   const patch = {
@@ -658,16 +713,16 @@ export async function syncMyAccount(userId, akunId = null) {
       return {
         id: String(t.ticket ?? ''),
         symbol: t.symbol ?? '',
-        type: (t.side || '').toUpperCase(),
-        lots: parseFloat(t.volume) || 0,
-        openPrice: parseFloat(t.open_price) || 0,
-        closePrice: parseFloat(t.close_price) || 0,
+        type: normalizeOrderType(t.type ?? t.side),
+        lots: parseFloat(t.volume ?? t.lots) || 0,
+        openPrice: parseFloat(t.open_price ?? t.price) || 0,
+        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
         pl: parseFloat(t.profit) || 0,
         swap: parseFloat(t.swap) || 0,
         commission: parseFloat(t.commission) || 0,
         openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
         closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
-        status: (t.status || 'CLOSED').toUpperCase(),
+        status: String(t.status || 'CLOSED').toUpperCase(),
       };
     });
   }
@@ -759,7 +814,7 @@ export async function listMyPositions(userId, { akunId = null } = {}) {
     const positions = rawPos.map((p) => ({
       ticket: String(p.ticket ?? p.id ?? ''),
       symbol: p.symbol ?? '',
-      type: (p.type || p.side || '').toUpperCase(),
+      type: normalizePositionType(p.type, p.side),
       volume: parseFloat(p.volume || p.lots) || 0,
       lots: parseFloat(p.volume || p.lots) || 0,
       openPrice: parseFloat(p.open_price || p.price) || 0,
@@ -814,7 +869,7 @@ export async function listMyDeals(userId, { limit = 200, akunId = null } = {}) {
       order: String(d.order ?? ''),
       position_id: String(d.position_id ?? ''),
       symbol: d.symbol ?? '',
-      type: (d.type || '').toUpperCase(),
+      type: normalizeDealType(d.type),
       entry: d.entry,
       volume: parseFloat(d.volume) || 0,
       price: parseFloat(d.price) || 0,
@@ -865,7 +920,7 @@ export async function listMyOrders(userId, { akunId = null } = {}) {
     const orders = rawOrders.map((o) => ({
       ticket: String(o.ticket ?? ''),
       symbol: o.symbol ?? '',
-      type: (o.type || '').toUpperCase(),
+      type: normalizeOrderType(o.type ?? o.side),
       volume: parseFloat(o.volume || o.lots) || 0,
       openPrice: parseFloat(o.open_price || o.price) || 0,
       sl: parseFloat(o.sl) || 0,
