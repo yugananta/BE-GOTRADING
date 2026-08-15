@@ -82,7 +82,66 @@ export function normalizeDealType(val) {
   const str = String(val).trim().toUpperCase();
   if (str === '0') return 'BUY';
   if (str === '1') return 'SELL';
+  if (str === '2' || str === 'DEAL_TYPE_BALANCE') return 'BALANCE';
   return str;
+}
+
+export function mapBalanceDealToTrade(d) {
+  if (!d) return null;
+  const timeIso = d.time_msc != null
+    ? new Date(d.time_msc).toISOString()
+    : (d.time ? new Date(d.time * 1000).toISOString() : (d.time_setup ? new Date(d.time_setup).toISOString() : null));
+  return {
+    id: String(d.ticket ?? d.order ?? ''),
+    symbol: d.symbol || '',
+    type: 'BALANCE',
+    lots: parseFloat(d.volume) || 0,
+    openPrice: parseFloat(d.price) || 0,
+    closePrice: parseFloat(d.price) || 0,
+    pl: parseFloat(d.profit) || 0,
+    swap: parseFloat(d.swap) || 0,
+    commission: parseFloat(d.commission) || 0,
+    openTime: timeIso,
+    closeTime: timeIso,
+    status: 'CLOSED',
+    comment: d.comment || '',
+  };
+}
+
+export function extractBalanceTrades(deals) {
+  if (!Array.isArray(deals)) return [];
+  return deals
+    .filter((d) => {
+      if (!d) return false;
+      const typeStr = normalizeDealType(d.type);
+      return typeStr === 'BALANCE' || d.type === 2 || (!d.symbol && parseFloat(d.profit) !== 0);
+    })
+    .map(mapBalanceDealToTrade)
+    .filter(Boolean);
+}
+
+export function combineTradesWithBalanceDeals(trades, deals) {
+  const mappedTrades = (trades || []).map((t) => ({ ...t }));
+  const balanceTrades = extractBalanceTrades(deals);
+
+  const existingIds = new Set(mappedTrades.map((t) => t.id));
+  for (const b of balanceTrades) {
+    if (b.id && !existingIds.has(b.id)) {
+      mappedTrades.push(b);
+      existingIds.add(b.id);
+    } else if (!b.id) {
+      mappedTrades.push(b);
+    }
+  }
+
+  // Urutkan transaksi terbaru di atas berdasarkan closeTime / openTime
+  mappedTrades.sort((a, b) => {
+    const timeA = new Date(a.closeTime || a.openTime || 0).getTime();
+    const timeB = new Date(b.closeTime || b.openTime || 0).getTime();
+    return timeB - timeA;
+  });
+
+  return mappedTrades;
 }
 
 function isAuthError(err) {
@@ -305,7 +364,7 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
 
   if (gwTrades && gwTrades.trades) {
     const timeline = buildDealTimeline(gwDeals);
-    const trades = (gwTrades.trades || []).slice(0, limitNum).map((t) => {
+    const regularTrades = (gwTrades.trades || []).map((t) => {
       const tl = timeline[t.ticket] || {};
       return {
         id: String(t.ticket ?? ''),
@@ -323,12 +382,15 @@ export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) 
       };
     });
 
+    const combinedTrades = combineTradesWithBalanceDeals(regularTrades, gwDeals);
+    const trades = combinedTrades.slice(0, limitNum);
+
     supabase
       .from('user_mt5_accounts')
       .update({
         snapshot: {
           ...row.snapshot,
-          trades,
+          trades: combinedTrades,
           fetched_at: new Date().toISOString(),
         },
       })
@@ -501,7 +563,7 @@ export async function connectMyAccount(userId, { platform, login, password, serv
   try {
     if (initialTrades && initialTrades.length > 0) {
       const timeline = buildDealTimeline(initialDeals);
-      mappedTrades = initialTrades.map((t) => {
+      const regularTrades = initialTrades.map((t) => {
         const tl = timeline[t.ticket] || {};
         return {
           id: String(t.ticket ?? ''),
@@ -518,6 +580,9 @@ export async function connectMyAccount(userId, { platform, login, password, serv
           status: String(t.status || 'CLOSED').toUpperCase(),
         };
       });
+      mappedTrades = combineTradesWithBalanceDeals(regularTrades, initialDeals);
+    } else if (initialDeals && initialDeals.length > 0) {
+      mappedTrades = extractBalanceTrades(initialDeals);
     }
 
     if (initialPositions && initialPositions.length > 0) {
@@ -708,7 +773,7 @@ export async function syncMyAccount(userId, akunId = null) {
   let newTrades = row.snapshot?.trades || [];
   if (gwTrades && gwTrades.trades) {
     const timeline = buildDealTimeline(gwDeals);
-    newTrades = gwTrades.trades.map((t) => {
+    const regularTrades = gwTrades.trades.map((t) => {
       const tl = timeline[t.ticket] || {};
       return {
         id: String(t.ticket ?? ''),
@@ -725,6 +790,9 @@ export async function syncMyAccount(userId, akunId = null) {
         status: String(t.status || 'CLOSED').toUpperCase(),
       };
     });
+    newTrades = combineTradesWithBalanceDeals(regularTrades, gwDeals);
+  } else if (gwDeals && gwDeals.length > 0) {
+    newTrades = combineTradesWithBalanceDeals(newTrades, gwDeals);
   }
 
   let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
