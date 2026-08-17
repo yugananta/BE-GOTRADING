@@ -43,9 +43,16 @@ let cycleRunning = false;
 
 function isAuthError(err) {
   if (!err) return false;
+  // HTTP 400 dari gateway Python bisa berisi pesan non-auth seperti
+  // "'NoneType' object has no attribute 'connected'" -- jangan diklasifikasikan
+  // sebagai auth error. Hanya status 401 yang selalu auth error.
   if (err.status === 401) return true;
-  const msg = String(err.message || err.body?.detail || '').toLowerCase();
-  return /login|password|credential|invalid|authentication|invalid_user_or_password/i.test(msg);
+  // Untuk status lain, gunakan regex yang SANGAT spesifik ke pesan broker MT5.
+  // Hindari keyword umum seperti 'invalid', 'login', 'password' yang bisa
+  // muncul di error infrastruktur / Python gateway non-auth.
+  if (err.status !== 400 && err.status !== 422) return false;
+  const msg = String(err.message || err.body?.detail || err.body?.error || '').toLowerCase();
+  return /invalid_user_or_password|invalid login|invalid password|wrong password|authentication failed|auth_failed|login failed|password incorrect|no connection|authorization failed/i.test(msg);
 }
 
 function backoffDelay(attempt) {
