@@ -233,6 +233,7 @@ function mapGatewayAccount(gw, stored) {
     last_connected_at: stored?.last_connected_at || null,
     credential_saved: stored?.credential_saved !== undefined ? Boolean(stored.credential_saved) : false,
     updated_at: stored?.updated_at || null,
+    fetched_at: stored?.snapshot?.fetched_at || stored?.updated_at || null,
     balance: toNum(gw?.balance),
     equity: toNum(gw?.equity),
     profit: toNum(gw?.profit),
@@ -747,6 +748,7 @@ export async function syncMyAccount(userId, akunId = null) {
   let gwTrades = null;
   let gwDeals = [];
   let live = false;
+  let syncError = null;
 
   if (creds && row.credential_saved) {
     try {
@@ -767,7 +769,11 @@ export async function syncMyAccount(userId, akunId = null) {
       }
     } catch (e) {
       console.warn('[MT5] Gateway sync failed:', e.message);
+      syncError = e;
     }
+  } else {
+    syncError = new Error('Kredensial akun MT5 tidak ditemukan atau belum disimpan');
+    syncError.status = 400;
   }
 
   let newTrades = row.snapshot?.trades || [];
@@ -796,10 +802,19 @@ export async function syncMyAccount(userId, akunId = null) {
   }
 
   let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
+  let errorMessage = row.error_message || null;
+
   if (live) {
     connStatus = CONN_STATUS.CONNECTED;
-  } else if (row.credential_saved && connStatus !== CONN_STATUS.ERROR) {
-    connStatus = CONN_STATUS.RECONNECTING;
+    errorMessage = null;
+  } else if (syncError) {
+    if (isAuthError(syncError)) {
+      connStatus = CONN_STATUS.ERROR;
+      errorMessage = 'Credential MT5 invalid atau sudah kedaluwarsa. Silakan hubungkan ulang akun Anda.';
+    } else {
+      connStatus = CONN_STATUS.RECONNECTING;
+      errorMessage = syncError.body?.detail || syncError.message || GATEWAY_UNAVAILABLE_MSG;
+    }
   }
 
   const nowIso = new Date().toISOString();
@@ -809,13 +824,13 @@ export async function syncMyAccount(userId, akunId = null) {
       status: 'connected',
       conn_status: connStatus,
       last_connected_at: live ? nowIso : (row.last_connected_at || null),
-      error_message: live ? null : (row.error_message || 'Menunggu reconnect otomatis...'),
+      error_message: errorMessage,
       updated_at: nowIso,
       snapshot: {
         ...row.snapshot,
         account: live ? gw : row.snapshot?.account,
         trades: newTrades,
-        fetched_at: nowIso,
+        fetched_at: live ? nowIso : (row.snapshot?.fetched_at || row.updated_at || nowIso),
       },
     })
     .eq('id', row.id)
@@ -823,6 +838,13 @@ export async function syncMyAccount(userId, akunId = null) {
     .single();
 
   if (error) throw error;
+
+  if (syncError) {
+    const err = new Error(errorMessage);
+    err.status = syncError.status || 400;
+    err.conn_status = connStatus;
+    throw err;
+  }
 
   return {
     success: true,
