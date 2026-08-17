@@ -534,8 +534,8 @@ export async function syncTradesToTaraptiDb(row, gwTrades, gwDeals) {
   }
 }
 
-export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fallbackTrades = null) {
-  // 1. Fetch from TARAPTI DB (relational)
+export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fallbackTrades = null, gwPositions = null) {
+  // 1. Fetch from TARAPTI DB (relational) — source of truth for closed trades
   let dbTrades = [];
   try {
     const { rows: akunRows } = await queryTaraptiDb(
@@ -591,9 +591,29 @@ export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fa
     console.warn('[MT5] Gagal fetch data dari TARAPTI DB, lanjut dengan snapshot/live:', err.message);
   }
 
-  // 2. Map & Filter open/floating trades (live or fallback snapshot)
+  // 2. Build open/floating positions from live /positions endpoint (real-time profit)
+  //    Fallback to /trades OPEN entries, then snapshot.
   let openTrades = [];
-  if (gwTrades && gwTrades.trades) {
+  const livePositions = gwPositions?.positions || [];
+  if (livePositions.length > 0) {
+    // Primary: use /positions for accurate live profit, swap, currentPrice
+    openTrades = livePositions.map((p) => ({
+      id: String(p.ticket ?? ''),
+      symbol: p.symbol ?? '',
+      type: normalizePositionType(p.type, p.side),
+      lots: parseFloat(p.volume ?? p.lots) || 0,
+      openPrice: parseFloat(p.price_open ?? p.open_price ?? p.price) || 0,
+      closePrice: parseFloat(p.price_current ?? p.current_price) || 0,
+      pl: parseFloat(p.profit) || 0,
+      swap: parseFloat(p.swap) || 0,
+      commission: parseFloat(p.commission) || 0,
+      openTime: p.time ? new Date(p.time * 1000).toISOString() : (p.open_time ? new Date(p.open_time).toISOString() : null),
+      closeTime: null,  // always null — these are open positions
+      status: 'OPEN',
+      comment: p.comment || '',
+    }));
+  } else if (gwTrades && gwTrades.trades) {
+    // Fallback: filter OPEN entries from /trades endpoint
     const timeline = buildDealTimeline(gwDeals || []);
     const regularTrades = (gwTrades.trades || []).map((t) => {
       const tl = timeline[t.ticket] || {};
@@ -612,34 +632,33 @@ export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fa
         status: String(t.status || 'CLOSED').toUpperCase(),
       };
     });
-    // Filter out closed trades from the gateway response to prevent duplicate/stale closed items
     openTrades = regularTrades.filter((t) => t.status === 'OPEN' || !t.closeTime);
   } else {
+    // Last resort: use snapshot
     const sourceTrades = fallbackTrades || row.snapshot?.trades || [];
     openTrades = sourceTrades.filter((t) => t.status === 'OPEN' || !t.closeTime);
   }
 
   // 3. Combine & Deduplicate by ticket ID
+  // DB closed trades go in first; open trades overlay/replace any stale entries
   const tradeMap = new Map();
-  // Fill DB closed trades first
   for (const t of dbTrades) {
     tradeMap.set(t.id, t);
   }
-  // Overlay open trades from gateway
   for (const t of openTrades) {
     tradeMap.set(t.id, t);
   }
 
   const merged = Array.from(tradeMap.values());
 
-  // 4. Sort
+  // 4. Sort: most recent first
   merged.sort((a, b) => {
     const timeA = new Date(a.closeTime || a.openTime || 0).getTime();
     const timeB = new Date(b.closeTime || b.openTime || 0).getTime();
     return timeB - timeA;
   });
 
-  console.log(`[MT5-MERGE] dbTrades count: ${dbTrades.length}, openTrades count: ${openTrades.length}, merged: ${merged.length}`);
+  console.log(`[MT5-MERGE] dbTrades: ${dbTrades.length}, livePositions: ${livePositions.length}, openTradesFallback: ${openTrades.length - livePositions.length}, merged: ${merged.length}`);
   return merged;
 }
 
@@ -652,19 +671,34 @@ export async function listMyTrades(userId, optsOrAkunId = {}) {
     : 2000;
   let gwTrades = null;
   let gwDeals = [];
+  let gwPositions = null;
   const creds = getAccountCredentials(row);
 
   if (creds && row.credential_saved) {
-    try {
-      gwTrades = await getTrades(creds);
-      try {
-        const dealsRes = await getDeals(creds);
-        gwDeals = dealsRes?.deals || [];
-      } catch (err) {
-        console.warn('[MT5] Gagal ambil /deals, lanjut tanpa timeline:', err.message);
-      }
-    } catch (err) {
-      console.warn('[MT5] Gagal ambil trades dari gateway, fallback ke snapshot:', err.message);
+    // Fetch /trades, /deals, and /positions in parallel for speed
+    const [tradesResult, dealsResult, positionsResult] = await Promise.allSettled([
+      getTrades(creds),
+      getDeals(creds),
+      getPositions(creds),
+    ]);
+
+    if (tradesResult.status === 'fulfilled') {
+      gwTrades = tradesResult.value;
+    } else {
+      console.warn('[MT5] Gagal ambil /trades dari gateway, fallback ke snapshot:', tradesResult.reason?.message);
+    }
+
+    if (dealsResult.status === 'fulfilled') {
+      gwDeals = dealsResult.value?.deals || [];
+    } else {
+      console.warn('[MT5] Gagal ambil /deals, lanjut tanpa timeline:', dealsResult.reason?.message);
+    }
+
+    if (positionsResult.status === 'fulfilled') {
+      gwPositions = positionsResult.value;
+      console.log(`[MT5-POS] Live positions fetched: ${gwPositions?.count ?? gwPositions?.positions?.length ?? 0}`);
+    } else {
+      console.warn('[MT5] Gagal ambil /positions, floating P&L mungkin 0:', positionsResult.reason?.message);
     }
   }
 
@@ -672,7 +706,7 @@ export async function listMyTrades(userId, optsOrAkunId = {}) {
     await syncTradesToTaraptiDb(row, gwTrades, gwDeals);
   }
 
-  const trades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals);
+  const trades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, null, gwPositions);
 
   // Update snapshot asynchronously for offline fallback purposes
   supabase
