@@ -11,12 +11,22 @@ const router = Router();
 router.use(requireAuth);
 
 // GET /account -- kembalikan SEMUA akun MT5 milik user (bukan cuma satu),
-// supaya frontend (Account.tsx) bisa menampilkan tab multi-akun.
+// supaya frontend (Account.tsx / Journal.tsx) bisa menampilkan tab multi-akun.
 router.get('/account', async (req, res, next) => {
   try {
     const { accounts } = await listMyAccounts(req.user.sub);
+    const target = req.query.login || req.query.akunId || req.query.accountId || req.query.id || null;
+    let singleAccount = null;
+    if (target && accounts.length > 0) {
+      const targetStr = String(target).trim();
+      singleAccount = accounts.find(
+        (a) => String(a.login) === targetStr || String(a.id) === targetStr || String(a.akunId) === targetStr
+      ) || accounts[0];
+    } else {
+      singleAccount = accounts.length > 0 ? accounts[0] : null;
+    }
     res.json({
-      account: accounts.length > 0 ? accounts[0] : null,
+      account: singleAccount,
       accounts,
     });
   }
@@ -92,19 +102,11 @@ router.post('/connect', async (req, res, next) => {
   catch (err) { next(err); }
 });
 
-// POST /disconnect -- WAJIB terima accountId/akunId dari body. Tanpa ini,
-// disconnectMyAccount akan memutus SEMUA akun MT5 milik user (lihat
-// warning log di metatraderService.js). Account.tsx mengirim
-// { accountId: activeAccount.id } -- pastikan mapGatewayAccount di
-// metatraderService.js sudah mengembalikan field `id` (row UUID), atau
-// sesuaikan di sini untuk menerima akun_id/login sebagai alternatif.
+// POST /disconnect -- terima accountId/akunId/login dari body atau query.
 router.post('/disconnect', async (req, res, next) => {
   try {
-    const { accountId, akunId, login } = req.body || {};
-    // Terima beberapa kemungkinan nama field dari frontend untuk fleksibilitas,
-    // tapi utamakan akunId/login (nomor akun MT5) karena itu yang dipakai
-    // sebagai filter di query Supabase, BUKAN id/UUID row.
-    const targetAkunId = akunId || login || accountId;
+    const { accountId, akunId, login, id } = req.body || {};
+    const targetAkunId = akunId || login || accountId || id || req.query.login || req.query.accountId || req.query.akunId || req.query.id || null;
 
     if (!targetAkunId) {
       console.warn('[MT5 route] POST /disconnect tanpa accountId/akunId -- akan memutus SEMUA akun user:', req.user.sub);
@@ -119,12 +121,11 @@ router.post('/disconnect', async (req, res, next) => {
   catch (err) { next(err); }
 });
 
-// POST /sync -- terima akunId dari body supaya sync akun yang benar
-// (akun yang sedang aktif di tab), bukan selalu akun "terbaru".
+// POST /sync -- terima akunId/accountId/login dari body atau query
 router.post('/sync', async (req, res, next) => {
   try {
-    const { accountId, akunId, login } = req.body || {};
-    const targetAkunId = akunId || login || accountId || null;
+    const { accountId, akunId, login, id } = req.body || {};
+    const targetAkunId = akunId || login || accountId || id || req.query.login || req.query.accountId || req.query.akunId || req.query.id || null;
     res.json(await syncMyAccount(req.user.sub, targetAkunId));
   }
   catch (err) { next(err); }

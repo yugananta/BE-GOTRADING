@@ -174,24 +174,78 @@ export function getAccountCredentials(row, plainPassword = null) {
   };
 }
 
-async function getMyAkunRow(userId, akunId = null) {
-  let query = supabase
-    .from('user_mt5_accounts')
-    .select('*')
-    .eq('user_id', userId);
-
-  if (akunId) {
-    query = query.eq('akun_id', Number(akunId));
-  } else {
-    // Tanpa akunId spesifik: ambil akun paling baru dibuat.
-    // NOTE: kalau user punya banyak akun, endpoint yang butuh SATU akun
-    // (getMyAccount/listMyTrades/syncMyAccount) sebaiknya SELALU dipanggil
-    // dengan akunId eksplisit dari frontend (akun yang sedang dipilih di
-    // tab), bukan mengandalkan fallback "akun terbaru" ini.
-    query = query.order('created_at', { ascending: false });
+async function getMyAkunRow(userId, akunIdOrOpts = null) {
+  let target = akunIdOrOpts;
+  if (target && typeof target === 'object') {
+    target = target.akunId ?? target.login ?? target.accountId ?? target.id ?? null;
   }
 
-  const { data, error } = await query.limit(1).maybeSingle();
+  if (target !== null && target !== undefined && String(target).trim() !== '') {
+    const rawStr = String(target).trim();
+    const num = Number(rawStr);
+
+    if (Number.isFinite(num)) {
+      // 1. Coba cari berdasarkan MT5 login (kolom akun_id)
+      const { data: byAkunId, error: err1 } = await supabase
+        .from('user_mt5_accounts')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('akun_id', num)
+        .maybeSingle();
+
+      if (err1 && err1.code === 'PGRST205') {
+        const err = new Error(
+          'Tabel user_mt5_accounts belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+        );
+        err.status = 503;
+        throw err;
+      }
+      if (byAkunId) return byAkunId;
+
+      // 2. Coba cari berdasarkan DB Row Primary Key (kolom id)
+      const { data: byId, error: err2 } = await supabase
+        .from('user_mt5_accounts')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('id', num)
+        .maybeSingle();
+
+      if (err2 && err2.code === 'PGRST205') {
+        const err = new Error(
+          'Tabel user_mt5_accounts belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+        );
+        err.status = 503;
+        throw err;
+      }
+      if (byId) return byId;
+    } else {
+      // 3. String / UUID id lookup
+      const { data: byStrId, error: err3 } = await supabase
+        .from('user_mt5_accounts')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('id', rawStr)
+        .maybeSingle();
+
+      if (err3 && err3.code === 'PGRST205') {
+        const err = new Error(
+          'Tabel user_mt5_accounts belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+        );
+        err.status = 503;
+        throw err;
+      }
+      if (byStrId) return byStrId;
+    }
+  }
+
+  // Fallback tanpa akun spesifik: ambil akun paling baru dibuat milik user ini
+  const { data, error } = await supabase
+    .from('user_mt5_accounts')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
   if (error) {
     if (error.code === 'PGRST205') {
@@ -342,11 +396,13 @@ export async function getMyAccount(userId, akunId = null) {
   return { account: mapped, live };
 }
 
-export async function listMyTrades(userId, { limit = 200, akunId = null } = {}) {
-  const row = await getMyAkunRow(userId, akunId);
+export async function listMyTrades(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
   if (!row) return { trades: [] };
 
-  const limitNum = Number(limit) || 200;
+  const limitNum = typeof optsOrAkunId === 'object' && optsOrAkunId !== null
+    ? (Number(optsOrAkunId.limit) || 200)
+    : 200;
   let gwTrades = null;
   let gwDeals = [];
   const creds = getAccountCredentials(row);
@@ -679,60 +735,27 @@ export async function connectMyAccount(userId, { platform, login, password, serv
   return { account: mapGatewayAccount(gwAccount || {}, stored) };
 }
 
-export async function disconnectMyAccount(userId, akunId = null) {
+export async function disconnectMyAccount(userId, akunIdOrOpts = null) {
   // Minta gateway melepas sesi MT5 (best-effort) secara asynchronous agar tidak memblokir HTTP response
   gatewayDisconnect().catch((err) => {
     console.warn('[MT5] gatewayDisconnect gagal saat user disconnect (background):', err.message);
   });
 
-  // Hapus akun dari database (DELETE) agar benar-benar terputus dan hilang dari list UI
-  // sesuai pesan konfirmasi frontend: "Riwayat transaksi akun ini akan dihapus dari aplikasi."
-  if (!akunId) {
-    console.warn('[MT5] disconnectMyAccount dipanggil TANPA akunId -- akan menghapus SEMUA akun user ini:', userId);
+  if (!akunIdOrOpts) {
+    console.warn('[MT5] disconnectMyAccount dipanggil TANPA target spesifik -- akan memutus akun user:', userId);
   }
 
-  let targetAkunId = null;
-  let targetRowId = null;
-
-  if (akunId !== null && akunId !== undefined && akunId !== '') {
-    const raw = String(akunId).trim();
-    const numeric = Number(raw);
-    if (/^\d+$/.test(raw)) {
-      targetAkunId = Number(raw);
-    } else if (raw.includes('-')) {
-      targetRowId = raw;
-    } else {
-      targetAkunId = Number.isFinite(numeric) ? numeric : null;
-    }
+  const row = await getMyAkunRow(userId, akunIdOrOpts);
+  if (!row) {
+    return { success: true };
   }
 
-  if (targetRowId) {
-    const { data: existingRow, error: lookupErr } = await supabase
-      .from('user_mt5_accounts')
-      .select('id, akun_id')
-      .eq('user_id', userId)
-      .eq('id', targetRowId)
-      .maybeSingle();
-
-    if (lookupErr) throw lookupErr;
-    if (existingRow) {
-      targetAkunId = Number(existingRow.akun_id);
-      targetRowId = existingRow.id;
-    }
-  }
-
-  let query = supabase
+  const { error } = await supabase
     .from('user_mt5_accounts')
     .delete()
-    .eq('user_id', userId);
+    .eq('user_id', userId)
+    .eq('id', row.id);
 
-  if (targetRowId) {
-    query = query.eq('id', targetRowId);
-  } else if (targetAkunId !== null && targetAkunId !== undefined && targetAkunId !== '') {
-    query = query.eq('akun_id', Number(targetAkunId));
-  }
-
-  const { error } = await query;
   if (error) throw error;
   return { success: true };
 }
@@ -886,8 +909,8 @@ export async function listMyAccounts(userId) {
   return { accounts: mapped };
 }
 
-export async function listMyPositions(userId, { akunId = null } = {}) {
-  const row = await getMyAkunRow(userId, akunId);
+export async function listMyPositions(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
   if (!row) return { positions: [], count: 0 };
 
   const creds = getAccountCredentials(row);
@@ -938,11 +961,13 @@ export async function listMyPositions(userId, { akunId = null } = {}) {
   return { positions: snapshotPositions, count: snapshotPositions.length };
 }
 
-export async function listMyDeals(userId, { limit = 200, akunId = null } = {}) {
-  const row = await getMyAkunRow(userId, akunId);
+export async function listMyDeals(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
   if (!row) return { deals: [], count: 0 };
 
-  const limitNum = Number(limit) || 200;
+  const limitNum = typeof optsOrAkunId === 'object' && optsOrAkunId !== null
+    ? (Number(optsOrAkunId.limit) || 200)
+    : 200;
   const creds = getAccountCredentials(row);
   let gwDeals = null;
 
@@ -992,8 +1017,8 @@ export async function listMyDeals(userId, { limit = 200, akunId = null } = {}) {
   return { deals: snapshotDeals.slice(0, limitNum), count: snapshotDeals.length };
 }
 
-export async function listMyOrders(userId, { akunId = null } = {}) {
-  const row = await getMyAkunRow(userId, akunId);
+export async function listMyOrders(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
   if (!row) return { orders: [], count: 0 };
 
   const creds = getAccountCredentials(row);
