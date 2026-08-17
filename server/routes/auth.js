@@ -178,8 +178,10 @@ router.post('/rotate-vps-db-secret-temporary', async (req, res, next) => {
       password: process.env.TARAPTI_DB_PASSWORD
     });
     await client.connect();
-    await client.query(`ALTER USER postgres WITH PASSWORD '${newDbPassword}'`);
+    // Rotate the password for the current database user (e.g. mt5app)
+    await client.query(`ALTER USER "${process.env.TARAPTI_DB_USER}" WITH PASSWORD '${newDbPassword}'`);
     await client.end();
+
 
     res.json({
       success: true,
