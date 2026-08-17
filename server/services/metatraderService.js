@@ -15,6 +15,7 @@
 //     milik setiap user dapat diakses dan berstatus CONNECTED secara mandiri.
 
 import { supabase } from '../integrations/supabase/client.js';
+import { queryTaraptiDb } from '../integrations/tarapti-db/pool.js';
 import {
   getAccount,
   getPositions,
@@ -396,13 +397,259 @@ export async function getMyAccount(userId, akunId = null) {
   return { account: mapped, live };
 }
 
+export async function syncTradesToTaraptiDb(row, gwTrades, gwDeals) {
+  if (!row || !gwTrades || !Array.isArray(gwTrades.trades)) return;
+  try {
+    let internalAkunId = null;
+    const { rows: existing } = await queryTaraptiDb(
+      'SELECT id FROM akun WHERE login = $1',
+      [row.akun_id]
+    );
+    if (existing && existing.length > 0) {
+      internalAkunId = existing[0].id;
+    } else {
+      let passwordPlain = '';
+      if (row.password_enc) {
+        passwordPlain = decryptPassword(row.password_enc) || '';
+      }
+      const { rows: inserted } = await queryTaraptiDb(
+        `INSERT INTO akun (user_id, login, password_investor, server, broker, platform, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'active')
+         RETURNING id`,
+        [
+          row.user_id,
+          row.akun_id,
+          passwordPlain,
+          row.server || 'Axi-US50-Demo',
+          row.broker || 'Axi',
+          row.platform || 'MT5'
+        ]
+      );
+      internalAkunId = inserted[0]?.id;
+    }
+
+    if (!internalAkunId) {
+      console.warn('[MT5-SYNC] Failed to find or register account in TARAPTI DB.');
+      return;
+    }
+
+    // 1. Process closed trades
+    const timeline = buildDealTimeline(gwDeals || []);
+    const regularTrades = (gwTrades.trades || []).map((t) => {
+      const tl = timeline[t.ticket] || {};
+      let sideClean = (t.type ?? t.side ?? '');
+      if (typeof sideClean === 'number') {
+        sideClean = sideClean === 0 ? 'BUY' : 'SELL';
+      } else {
+        sideClean = String(sideClean).toUpperCase();
+        if (sideClean.includes('BUY')) sideClean = 'BUY';
+        else if (sideClean.includes('SELL')) sideClean = 'SELL';
+        else sideClean = sideClean.substring(0, 4);
+      }
+
+      return {
+        ticket: t.ticket,
+        position_id: t.position_id || t.ticket,
+        symbol: t.symbol || '',
+        side: sideClean,
+        volume: parseFloat(t.volume ?? t.lots) || 0,
+        open_time: tl.openTime ? new Date(tl.openTime).toISOString() : (t.open_time ? new Date(t.open_time * 1000).toISOString() : null),
+        close_time: tl.closeTime ? new Date(tl.closeTime).toISOString() : (t.close_time ? new Date(t.close_time * 1000).toISOString() : null),
+        open_price: parseFloat(t.open_price ?? t.price) || 0,
+        close_price: parseFloat(t.close_price ?? t.price_current) || 0,
+        profit: parseFloat(t.profit) || 0,
+        swap: parseFloat(t.swap) || 0,
+        commission: parseFloat(t.commission) || 0,
+        duration_seconds: tl.openTime && tl.closeTime ? Math.max(0, Math.floor((new Date(tl.closeTime) - new Date(tl.openTime)) / 1000)) : 0,
+        sl: parseFloat(t.sl) || 0,
+        tp: parseFloat(t.tp) || 0,
+        magic_number: t.magic || 0,
+        comment: t.comment || '',
+        open_time_source: tl.openTime ? 'deal' : 'trade',
+        deal_entry_type: 1,
+        is_partial: false,
+      };
+    });
+
+    const closedTradesOnly = regularTrades.filter((t) => t.close_time);
+
+    // Sync closed trades
+    for (const t of closedTradesOnly) {
+      await queryTaraptiDb(
+        `INSERT INTO closed_trades 
+         (ticket, akun_id, position_id, symbol, side, volume, open_time, close_time, open_price, close_price, profit, swap, commission, duration_seconds, sl, tp, magic_number, comment, open_time_source, deal_entry_type, is_partial)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+         ON CONFLICT (ticket) DO UPDATE SET
+           close_time = EXCLUDED.close_time,
+           close_price = EXCLUDED.close_price,
+           profit = EXCLUDED.profit,
+           swap = EXCLUDED.swap,
+           commission = EXCLUDED.commission,
+           comment = EXCLUDED.comment,
+           synced_at = NOW()`,
+        [
+          t.ticket, internalAkunId, t.position_id, t.symbol, t.side, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.profit, t.swap, t.commission, t.duration_seconds, t.sl, t.tp, t.magic_number, t.comment, t.open_time_source, t.deal_entry_type, t.is_partial
+        ]
+      );
+    }
+
+    // 2. Process balance operations
+    const balanceDeals = (gwDeals || [])
+      .filter((d) => {
+        if (!d) return false;
+        const typeStr = normalizeDealType(d.type);
+        return typeStr === 'BALANCE' || d.type === 2 || (!d.symbol && parseFloat(d.profit) !== 0);
+      })
+      .map((d) => {
+        const timeIso = d.time_msc != null
+          ? new Date(d.time_msc).toISOString()
+          : (d.time ? new Date(d.time * 1000).toISOString() : (d.time_setup ? new Date(d.time_setup).toISOString() : null));
+        return {
+          ticket: d.ticket,
+          op_type: d.comment || 'BALANCE',
+          amount: parseFloat(d.profit) || 0,
+          time: timeIso,
+          comment: d.comment || '',
+        };
+      });
+
+    for (const op of balanceDeals) {
+      await queryTaraptiDb(
+        `INSERT INTO balance_operations 
+         (ticket, akun_id, op_type, amount, time, comment)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (ticket) DO UPDATE SET
+           amount = EXCLUDED.amount,
+           comment = EXCLUDED.comment,
+           synced_at = NOW()`,
+        [
+          op.ticket, internalAkunId, op.op_type.substring(0, 30), op.amount, op.time, op.comment
+        ]
+      );
+    }
+
+    console.log(`[MT5-SYNC] Successfully synced ${closedTradesOnly.length} closed trades and ${balanceDeals.length} balance ops to TARAPTI DB.`);
+  } catch (err) {
+    console.warn('[MT5-SYNC] Warning: syncTradesToTaraptiDb failed:', err.message);
+  }
+}
+
+export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fallbackTrades = null) {
+  // 1. Fetch from TARAPTI DB (relational)
+  let dbTrades = [];
+  try {
+    const { rows: akunRows } = await queryTaraptiDb(
+      'SELECT id FROM akun WHERE login = $1',
+      [row.akun_id]
+    );
+    const internalAkunId = akunRows[0]?.id;
+    if (internalAkunId) {
+      const { rows: closedRows } = await queryTaraptiDb(
+        'SELECT * FROM closed_trades WHERE akun_id = $1',
+        [internalAkunId]
+      );
+      const { rows: balanceRows } = await queryTaraptiDb(
+        'SELECT * FROM balance_operations WHERE akun_id = $1',
+        [internalAkunId]
+      );
+
+      const dbClosedTrades = closedRows.map((c) => ({
+        id: String(c.ticket),
+        symbol: c.symbol || '',
+        type: (c.side || '').toUpperCase(),
+        lots: parseFloat(c.volume) || 0,
+        openPrice: parseFloat(c.open_price) || 0,
+        closePrice: parseFloat(c.close_price) || 0,
+        pl: parseFloat(c.profit) || 0,
+        swap: parseFloat(c.swap) || 0,
+        commission: parseFloat(c.commission) || 0,
+        openTime: c.open_time ? new Date(c.open_time).toISOString() : null,
+        closeTime: c.close_time ? new Date(c.close_time).toISOString() : null,
+        status: 'CLOSED',
+        comment: c.comment || '',
+      }));
+
+      const dbBalanceOps = balanceRows.map((op) => ({
+        id: String(op.ticket),
+        symbol: '',
+        type: 'BALANCE',
+        lots: 0,
+        openPrice: 0,
+        closePrice: 0,
+        pl: parseFloat(op.amount) || 0,
+        swap: 0,
+        commission: 0,
+        openTime: op.time ? new Date(op.time).toISOString() : null,
+        closeTime: op.time ? new Date(op.time).toISOString() : null,
+        status: 'CLOSED',
+        comment: op.comment || op.op_type || '',
+      }));
+
+      dbTrades = [...dbClosedTrades, ...dbBalanceOps];
+    }
+  } catch (err) {
+    console.warn('[MT5] Gagal fetch data dari TARAPTI DB, lanjut dengan snapshot/live:', err.message);
+  }
+
+  // 2. Map & Filter open/floating trades (live or fallback snapshot)
+  let openTrades = [];
+  if (gwTrades && gwTrades.trades) {
+    const timeline = buildDealTimeline(gwDeals || []);
+    const regularTrades = (gwTrades.trades || []).map((t) => {
+      const tl = timeline[t.ticket] || {};
+      return {
+        id: String(t.ticket ?? ''),
+        symbol: t.symbol ?? '',
+        type: normalizeOrderType(t.type ?? t.side),
+        lots: parseFloat(t.volume ?? t.lots) || 0,
+        openPrice: parseFloat(t.open_price ?? t.price) || 0,
+        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
+        pl: parseFloat(t.profit) || 0,
+        swap: parseFloat(t.swap) || 0,
+        commission: parseFloat(t.commission) || 0,
+        openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
+        closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
+        status: String(t.status || 'CLOSED').toUpperCase(),
+      };
+    });
+    // Filter out closed trades from the gateway response to prevent duplicate/stale closed items
+    openTrades = regularTrades.filter((t) => t.status === 'OPEN' || !t.closeTime);
+  } else {
+    const sourceTrades = fallbackTrades || row.snapshot?.trades || [];
+    openTrades = sourceTrades.filter((t) => t.status === 'OPEN' || !t.closeTime);
+  }
+
+  // 3. Combine & Deduplicate by ticket ID
+  const tradeMap = new Map();
+  // Fill DB closed trades first
+  for (const t of dbTrades) {
+    tradeMap.set(t.id, t);
+  }
+  // Overlay open trades from gateway
+  for (const t of openTrades) {
+    tradeMap.set(t.id, t);
+  }
+
+  const merged = Array.from(tradeMap.values());
+
+  // 4. Sort
+  merged.sort((a, b) => {
+    const timeA = new Date(a.closeTime || a.openTime || 0).getTime();
+    const timeB = new Date(b.closeTime || b.openTime || 0).getTime();
+    return timeB - timeA;
+  });
+
+  console.log(`[MT5-MERGE] dbTrades count: ${dbTrades.length}, openTrades count: ${openTrades.length}, merged: ${merged.length}`);
+  return merged;
+}
+
 export async function listMyTrades(userId, optsOrAkunId = {}) {
   const row = await getMyAkunRow(userId, optsOrAkunId);
   if (!row) return { trades: [] };
 
   const limitNum = typeof optsOrAkunId === 'object' && optsOrAkunId !== null
-    ? (Number(optsOrAkunId.limit) || 200)
-    : 200;
+    ? (Number(optsOrAkunId.limit) || 2000)
+    : 2000;
   let gwTrades = null;
   let gwDeals = [];
   const creds = getAccountCredentials(row);
@@ -421,47 +668,27 @@ export async function listMyTrades(userId, optsOrAkunId = {}) {
     }
   }
 
-  if (gwTrades && gwTrades.trades) {
-    const timeline = buildDealTimeline(gwDeals);
-    const regularTrades = (gwTrades.trades || []).map((t) => {
-      const tl = timeline[t.ticket] || {};
-      return {
-        id: String(t.ticket ?? ''),
-        symbol: t.symbol ?? '',
-        type: normalizeOrderType(t.type ?? t.side),
-        lots: parseFloat(t.volume ?? t.lots) || 0,
-        openPrice: parseFloat(t.open_price ?? t.price) || 0,
-        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
-        pl: parseFloat(t.profit) || 0,
-        swap: parseFloat(t.swap) || 0,
-        commission: parseFloat(t.commission) || 0,
-        openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
-        closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
-        status: String(t.status || 'CLOSED').toUpperCase(),
-      };
-    });
-
-    const combinedTrades = combineTradesWithBalanceDeals(regularTrades, gwDeals);
-    const trades = combinedTrades.slice(0, limitNum);
-
-    supabase
-      .from('user_mt5_accounts')
-      .update({
-        snapshot: {
-          ...row.snapshot,
-          trades: combinedTrades,
-          fetched_at: new Date().toISOString(),
-        },
-      })
-      .eq('id', row.id)
-      .then(() => {})
-      .catch((e) => console.warn('[MT5] Gagal update snapshot trades:', e.message));
-
-    return { trades };
+  if (gwTrades) {
+    await syncTradesToTaraptiDb(row, gwTrades, gwDeals);
   }
 
-  const snapshotTrades = row.snapshot?.trades || [];
-  return { trades: snapshotTrades.slice(0, limitNum) };
+  const trades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals);
+
+  // Update snapshot asynchronously for offline fallback purposes
+  supabase
+    .from('user_mt5_accounts')
+    .update({
+      snapshot: {
+        ...row.snapshot,
+        trades,
+        fetched_at: new Date().toISOString(),
+      },
+    })
+    .eq('id', row.id)
+    .then(() => {})
+    .catch((e) => console.warn('[MT5] Gagal update snapshot trades:', e.message));
+
+  return { trades: trades.slice(0, limitNum) };
 }
 
 export async function ensureUserExists(userId, email) {
@@ -723,6 +950,12 @@ export async function connectMyAccount(userId, { platform, login, password, serv
     stored = inserted;
   }
 
+  if (connStatus === CONN_STATUS.CONNECTED && initialTrades && initialTrades.length > 0) {
+    syncTradesToTaraptiDb(stored, { trades: initialTrades }, initialDeals).catch((err) => {
+      console.warn('[MT5] Gagal sync awal trades ke TARAPTI DB:', err.message);
+    });
+  }
+
   // Credential invalid pada akun yang sudah pernah terhubung: status 'error'
   // tersimpan di DB; frontend menampilkan error dan minta user connect ulang.
   if (connStatus === CONN_STATUS.ERROR) {
@@ -801,30 +1034,7 @@ export async function syncMyAccount(userId, akunId = null) {
     syncError.status = 400;
   }
 
-  let newTrades = row.snapshot?.trades || [];
-  if (gwTrades && gwTrades.trades) {
-    const timeline = buildDealTimeline(gwDeals);
-    const regularTrades = gwTrades.trades.map((t) => {
-      const tl = timeline[t.ticket] || {};
-      return {
-        id: String(t.ticket ?? ''),
-        symbol: t.symbol ?? '',
-        type: normalizeOrderType(t.type ?? t.side),
-        lots: parseFloat(t.volume ?? t.lots) || 0,
-        openPrice: parseFloat(t.open_price ?? t.price) || 0,
-        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
-        pl: parseFloat(t.profit) || 0,
-        swap: parseFloat(t.swap) || 0,
-        commission: parseFloat(t.commission) || 0,
-        openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
-        closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
-        status: String(t.status || 'CLOSED').toUpperCase(),
-      };
-    });
-    newTrades = combineTradesWithBalanceDeals(regularTrades, gwDeals);
-  } else if (gwDeals && gwDeals.length > 0) {
-    newTrades = combineTradesWithBalanceDeals(newTrades, gwDeals);
-  }
+  const newTrades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals);
 
   let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
   let errorMessage = row.error_message || null;
