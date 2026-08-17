@@ -159,40 +159,5 @@ router.get('/me', requireAuth, async (req, res, next) => {
   }
 });
 
-router.post('/rotate-vps-db-secret-temporary', async (req, res, next) => {
-  try {
-    if (req.body.secret !== 'super_secret_temporary_pass_123') {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    const crypto = await import('crypto');
-    const { Client } = await import('pg');
-    const newDbPassword = 'TaraptiSecure_' + crypto.randomBytes(8).toString('hex');
-    const newJwtAccessSecret = crypto.randomBytes(32).toString('hex');
-    const newJwtRefreshSecret = crypto.randomBytes(32).toString('hex');
-
-    const client = new Client({
-      host: process.env.TARAPTI_DB_HOST,
-      port: 5432,
-      database: process.env.TARAPTI_DB_NAME,
-      user: process.env.TARAPTI_DB_USER,
-      password: process.env.TARAPTI_DB_PASSWORD
-    });
-    await client.connect();
-    // Rotate the password for the current database user (e.g. mt5app)
-    await client.query(`ALTER USER "${process.env.TARAPTI_DB_USER}" WITH PASSWORD '${newDbPassword}'`);
-    await client.end();
-
-
-    res.json({
-      success: true,
-      TARAPTI_DB_PASSWORD: newDbPassword,
-      JWT_ACCESS_SECRET: newJwtAccessSecret,
-      JWT_REFRESH_SECRET: newJwtRefreshSecret
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
 export default router;
 
