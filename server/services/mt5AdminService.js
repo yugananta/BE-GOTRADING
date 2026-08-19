@@ -70,7 +70,7 @@ export async function getAccountAnalytics(akunId) {
      WHERE akun_id = $1`,
     [akunId]
   );
-  const row = rows[0];
+  const row = rows[0] || {};
   const totalPosisi = parseInt(row.total_posisi, 10) || 0;
   const posisiProfit = parseInt(row.posisi_profit, 10) || 0;
 
@@ -83,10 +83,23 @@ export async function getAccountAnalytics(akunId) {
     [akunId]
   );
 
+  let peakEquity = 0;
+  let maxDrawdownPct = 0;
+  for (const r of equityRows) {
+    const eq = parseFloat(r.equity) || 0;
+    if (eq > peakEquity) peakEquity = eq;
+    if (peakEquity > 0) {
+      const dd = ((peakEquity - eq) / peakEquity) * 100;
+      if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+    }
+  }
+
   return {
     totalPosisi,
     winRate: totalPosisi > 0 ? Number(((posisiProfit / totalPosisi) * 100).toFixed(2)) : 0,
     netProfit: parseFloat(row.net_profit) || 0,
+    peakEquity: Number(peakEquity.toFixed(2)),
+    maxDrawdownPct: Number(maxDrawdownPct.toFixed(2)),
     equityCurve: equityRows.map((r) => ({ time: r.recorded_at, equity: r.equity, balance: r.balance })),
   };
 }
@@ -132,7 +145,7 @@ export async function getCoachContract(akunId) {
     [akunId]
   );
 
-  // --- equity snapshots last 7 days (for Sharpe & exposure_pct) ---
+  // --- equity snapshots last 7 days (for Sharpe & exposure_pct & peak-to-trough DD) ---
   const { rows: snapRows } = await queryTaraptiDb(
     `SELECT recorded_at, equity, balance
      FROM equity_snapshots
@@ -146,14 +159,34 @@ export async function getCoachContract(akunId) {
   const toFloat = (v) => parseFloat(v) || 0;
   const toInt   = (v) => parseInt(v,  10) || 0;
 
-  const buildPeriod = (row) => {
+  // Hitung peak-to-trough max drawdown dari equity snapshots
+  const calculateSnapshotDrawdown = (snapshots) => {
+    let peak = 0;
+    let maxDd = 0;
+    for (const s of snapshots) {
+      const eq = toFloat(s.equity);
+      if (eq > peak) peak = eq;
+      if (peak > 0) {
+        const dd = ((peak - eq) / peak) * 100;
+        if (dd > maxDd) maxDd = dd;
+      }
+    }
+    return Number(maxDd.toFixed(2));
+  };
+
+  const weekDrawdown = calculateSnapshotDrawdown(snapRows);
+
+  const buildPeriod = (row, drawdownOverride = null) => {
     const total   = toInt(row.total_positions);
     const winning = toInt(row.winning_positions);
+    const dd = drawdownOverride !== null
+      ? drawdownOverride
+      : (toFloat(row.worst_trade) < 0 ? Math.abs(toFloat(row.worst_trade)) : 0);
     return {
       net_profit:      Number(toFloat(row.net_profit).toFixed(2)),
       total_positions: total,
       win_rate:        total > 0 ? Number(((winning / total) * 100).toFixed(2)) : 0,
-      max_drawdown:    Number(Math.min(0, toFloat(row.worst_trade)).toFixed(2)),
+      max_drawdown:    Number(dd.toFixed(2)),
       avg_hold_hours:  Number(toFloat(row.avg_hold_hours).toFixed(2)),
     };
   };
@@ -189,7 +222,7 @@ export async function getCoachContract(akunId) {
   })();
 
   const todayPeriod = buildPeriod(todayRows[0] || {});
-  const weekPeriod  = buildPeriod(weekRows[0]  || {});
+  const weekPeriod  = buildPeriod(weekRows[0]  || {}, weekDrawdown);
 
   return {
     schema_version: '1.0',

@@ -28,6 +28,7 @@ import {
   normalizeConnectResult,
 } from '../integrations/mt5-gateway/client.js';
 import { encryptPassword, decryptPassword } from './mt5CredentialStore.js';
+import { recordEquitySnapshot, calculateAccountPerformance } from './performanceService.js';
 
 const GATEWAY_UNAVAILABLE_MSG = 'MT5 Gateway tidak tersedia atau tidak dapat dihubungi';
 
@@ -262,7 +263,7 @@ async function getMyAkunRow(userId, akunIdOrOpts = null) {
 }
 
 // Konversi payload GET /account dari gateway ke bentuk yang dipakai FE.
-function mapGatewayAccount(gw, stored) {
+function mapGatewayAccount(gw, stored, performanceMetrics = null) {
   const toNum = (v) => {
     const n = parseFloat(v);
     return Number.isFinite(n) ? n : 0;
@@ -270,6 +271,15 @@ function mapGatewayAccount(gw, stored) {
   const storedConn = stored?.conn_status;
   const connStatus = storedConn
     || (stored?.status === 'connected' ? CONN_STATUS.CONNECTED : CONN_STATUS.DISCONNECTED);
+
+  const totalDeposit = toNum(performanceMetrics?.total_deposit ?? performanceMetrics?.totalDeposit ?? stored?.snapshot?.account?.total_deposit ?? stored?.snapshot?.account?.totalDeposit ?? stored?.total_deposit);
+  const totalWithdrawal = toNum(performanceMetrics?.total_withdrawal ?? performanceMetrics?.totalWithdrawal ?? stored?.snapshot?.account?.total_withdrawal ?? stored?.snapshot?.account?.totalWithdrawal ?? stored?.total_withdrawal);
+  const initialDeposit = toNum(performanceMetrics?.initial_deposit ?? performanceMetrics?.initialDeposit ?? stored?.snapshot?.account?.initial_deposit ?? stored?.snapshot?.account?.initialDeposit ?? stored?.initial_deposit ?? totalDeposit);
+  const peakEquity = toNum(performanceMetrics?.peak_equity ?? performanceMetrics?.peakEquity ?? stored?.snapshot?.account?.peak_equity ?? stored?.snapshot?.account?.peakEquity ?? stored?.peak_equity);
+  const totalPnl = toNum(performanceMetrics?.total_pnl ?? performanceMetrics?.totalPnl ?? stored?.snapshot?.account?.total_pnl ?? stored?.snapshot?.account?.totalPnl ?? stored?.total_pnl);
+  const performancePct = toNum(performanceMetrics?.performance_pct ?? performanceMetrics?.performancePct ?? stored?.snapshot?.account?.performance_pct ?? stored?.snapshot?.account?.performancePct ?? stored?.performance_pct);
+  const drawdownPct = toNum(performanceMetrics?.drawdown_pct ?? performanceMetrics?.drawdownPct ?? stored?.snapshot?.account?.drawdown_pct ?? stored?.snapshot?.account?.drawdownPct ?? stored?.drawdown_pct);
+
   return {
     // WAJIB: id row Supabase -- dipakai frontend (Account.tsx) untuk
     // handleDisconnect(activeAccount.id) supaya disconnect hanya memutus
@@ -297,6 +307,24 @@ function mapGatewayAccount(gw, stored) {
     margin: toNum(gw?.margin),
     freeMargin: toNum(gw?.margin_free),
     marginLevel: toNum(gw?.margin_level),
+
+    // Metrik performa portofolio & drawdown riil
+    totalDeposit,
+    totalWithdrawal,
+    initialDeposit,
+    peakEquity,
+    totalPnl,
+    performancePct,
+    drawdownPct,
+
+    // snake_case aliases
+    total_deposit: totalDeposit,
+    total_withdrawal: totalWithdrawal,
+    initial_deposit: initialDeposit,
+    peak_equity: peakEquity,
+    total_pnl: totalPnl,
+    performance_pct: performancePct,
+    drawdown_pct: drawdownPct,
   };
 }
 
@@ -331,6 +359,7 @@ export async function getMyAccount(userId, akunId = null) {
   let live = false;
   let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
   const creds = getAccountCredentials(row);
+  let perfMetrics = null;
 
   if (creds && row.credential_saved && connStatus !== CONN_STATUS.DISCONNECTED) {
     try {
@@ -339,6 +368,10 @@ export async function getMyAccount(userId, akunId = null) {
         gw = liveGw;
         live = true;
         connStatus = CONN_STATUS.CONNECTED;
+
+        // Record equity snapshot & calculate real performance metrics
+        await recordEquitySnapshot(row, liveGw);
+        perfMetrics = await calculateAccountPerformance(row, liveGw);
 
         supabase
           .from('user_mt5_accounts')
@@ -349,9 +382,16 @@ export async function getMyAccount(userId, akunId = null) {
             error_message: null,
             reconnect_attempts: 0,
             next_reconnect_at: null,
+            peak_equity: perfMetrics.peak_equity,
+            total_deposit: perfMetrics.total_deposit,
+            total_withdrawal: perfMetrics.total_withdrawal,
+            initial_deposit: perfMetrics.initial_deposit,
             snapshot: {
               ...row.snapshot,
-              account: gw,
+              account: {
+                ...gw,
+                ...perfMetrics,
+              },
               fetched_at: new Date().toISOString(),
             },
           })
@@ -393,7 +433,11 @@ export async function getMyAccount(userId, akunId = null) {
     leverage: 100,
   };
 
-  const mapped = mapGatewayAccount(gw || fallback, { ...row, conn_status: connStatus });
+  if (!perfMetrics) {
+    perfMetrics = await calculateAccountPerformance(row, gw || fallback);
+  }
+
+  const mapped = mapGatewayAccount(gw || fallback, { ...row, conn_status: connStatus }, perfMetrics);
   return { account: mapped, live };
 }
 
@@ -925,6 +969,22 @@ export async function connectMyAccount(userId, { platform, login, password, serv
     console.warn('[MT5] Gagal memproses format snapshot awal saat connect:', snapErr.message);
   }
 
+  // Record equity snapshot & calculate initial performance metrics
+  if (connStatus === CONN_STATUS.CONNECTED && gwAccount) {
+    await recordEquitySnapshot({ akun_id: akunId }, gwAccount);
+  }
+  const perfMetrics = await calculateAccountPerformance(
+    {
+      akun_id: akunId,
+      initial_deposit: parseFloat(gwAccount?.balance) || 0,
+      snapshot: isSameAccount ? existingUserRow?.snapshot : null,
+      peak_equity: isSameAccount ? existingUserRow?.peak_equity : 0,
+    },
+    gwAccount,
+    initialDeals,
+    mappedTrades
+  );
+
   const nowIso = new Date().toISOString();
   const patch = {
     status: 'connected',
@@ -937,12 +997,16 @@ export async function connectMyAccount(userId, { platform, login, password, serv
     error_message: errorMessage,
     reconnect_attempts: 0,
     next_reconnect_at: null,
+    peak_equity: perfMetrics.peak_equity,
+    total_deposit: perfMetrics.total_deposit,
+    total_withdrawal: perfMetrics.total_withdrawal,
+    initial_deposit: perfMetrics.initial_deposit,
     last_connected_at: connStatus === CONN_STATUS.CONNECTED
       ? nowIso
       : (isSameAccount ? (existingUserRow?.last_connected_at || null) : null),
     updated_at: nowIso,
     snapshot: {
-      account: connStatus === CONN_STATUS.CONNECTED ? gwAccount : (isSameAccount ? (existingUserRow?.snapshot?.account || null) : null),
+      account: connStatus === CONN_STATUS.CONNECTED ? { ...gwAccount, ...perfMetrics } : (isSameAccount ? (existingUserRow?.snapshot?.account || null) : null),
       trades: mappedTrades,
       positions: mappedPositions.length > 0 ? mappedPositions : (isSameAccount ? (existingUserRow?.snapshot?.positions || []) : []),
       requested_login: String(akunId),
@@ -1070,6 +1134,17 @@ export async function syncMyAccount(userId, akunId = null) {
 
   const newTrades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals);
 
+  // Record equity snapshot & calculate performance metrics
+  if (live && gw) {
+    await recordEquitySnapshot(row, gw);
+  }
+  const perfMetrics = await calculateAccountPerformance(
+    row,
+    live ? gw : row.snapshot?.account,
+    gwDeals,
+    newTrades
+  );
+
   let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
   let errorMessage = row.error_message || null;
 
@@ -1095,9 +1170,16 @@ export async function syncMyAccount(userId, akunId = null) {
       last_connected_at: live ? nowIso : (row.last_connected_at || null),
       error_message: errorMessage,
       updated_at: nowIso,
+      peak_equity: perfMetrics.peak_equity,
+      total_deposit: perfMetrics.total_deposit,
+      total_withdrawal: perfMetrics.total_withdrawal,
+      initial_deposit: perfMetrics.initial_deposit,
       snapshot: {
         ...row.snapshot,
-        account: live ? gw : row.snapshot?.account,
+        account: {
+          ...(live ? gw : row.snapshot?.account),
+          ...perfMetrics,
+        },
         trades: newTrades,
         fetched_at: live ? nowIso : (row.snapshot?.fetched_at || row.updated_at || nowIso),
       },
@@ -1117,7 +1199,7 @@ export async function syncMyAccount(userId, akunId = null) {
 
   return {
     success: true,
-    account: mapGatewayAccount(gw || row.snapshot?.account || {}, updated),
+    account: mapGatewayAccount(gw || row.snapshot?.account || {}, updated, perfMetrics),
     tradesCount: newTrades.length,
   };
 }
@@ -1131,7 +1213,7 @@ export async function listMyAccounts(userId) {
 
   if (error) throw error;
 
-  const mapped = (rows || []).map((row) => {
+  const mapped = await Promise.all((rows || []).map(async (row) => {
     const fallback = row.snapshot?.account || {
       login: row.akun_id,
       server: row.server || row.snapshot?.requested_server || 'Axi-US50-Demo',
@@ -1147,8 +1229,9 @@ export async function listMyAccounts(userId) {
     };
 
     const connStatus = row.conn_status || (row.status === 'connected' ? CONN_STATUS.CONNECTED : CONN_STATUS.DISCONNECTED);
-    return mapGatewayAccount(row.snapshot?.account || fallback, { ...row, conn_status: connStatus });
-  });
+    const metrics = await calculateAccountPerformance(row);
+    return mapGatewayAccount(row.snapshot?.account || fallback, { ...row, conn_status: connStatus }, metrics);
+  }));
 
   return { accounts: mapped };
 }

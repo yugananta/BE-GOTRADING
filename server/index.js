@@ -28,6 +28,7 @@ import analysisRoutes from './routes/analysis.js';
 import metricsRoutes from './routes/metrics.js';   // STEP 14
 import { httpMetricsMiddleware } from './middleware/httpMetrics.js'; // STEP 14
 import { startReconnectMonitor } from './services/mt5ReconnectService.js'; // MT5 auto-reconnect
+import { backfillAllAccountsPerformance } from './services/performanceService.js';
 
 const app = express();
 
@@ -111,4 +112,11 @@ app.listen(PORT, '0.0.0.0', () => {
   // yang tersimpan di database dan menyambungkan ulang akun MT5 secara
   // otomatis -- user TIDAK perlu login ulang ke Axi/MT5.
   startReconnectMonitor();
+
+  // BACKFILL PORTFOLIO PERFORMANCE & DRAWDOWN:
+  // Menghitung ulang total_deposit, total_withdrawal, peak_equity, total_pnl,
+  // performance_pct, dan drawdown_pct untuk semua akun yang ada di DB.
+  backfillAllAccountsPerformance().catch((err) => {
+    console.error('[PERF] Automatic performance backfill failed:', err);
+  });
 });
