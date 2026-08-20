@@ -579,8 +579,125 @@ export async function syncTradesToTaraptiDb(row, gwTrades, gwDeals) {
 }
 
 export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fallbackTrades = null, gwPositions = null) {
-  // 1. Fetch from TARAPTI DB (relational) — source of truth for closed trades
-  let dbTrades = [];
+  const tradeMap = new Map();
+
+  // 1. Primary Source: Data dari MT5 Gateway (/trades & /deals)
+  if (gwTrades && Array.isArray(gwTrades.trades) && gwTrades.trades.length > 0) {
+    const timeline = buildDealTimeline(gwDeals || []);
+    for (const t of gwTrades.trades) {
+      if (!t) continue;
+      const tl = timeline[t.ticket] || {};
+
+      let sideClean = (t.type ?? t.side ?? '');
+      if (typeof sideClean === 'number') {
+        sideClean = sideClean === 0 ? 'BUY' : 'SELL';
+      } else {
+        sideClean = String(sideClean).toUpperCase();
+        if (sideClean.includes('BUY')) sideClean = 'BUY';
+        else if (sideClean.includes('SELL')) sideClean = 'SELL';
+        else sideClean = sideClean.substring(0, 4);
+      }
+
+      const openIso = tl.openTime != null
+        ? new Date(tl.openTime).toISOString()
+        : (t.open_time != null ? new Date(typeof t.open_time === 'number' && t.open_time < 1e11 ? t.open_time * 1000 : t.open_time).toISOString() : null);
+
+      const closeIso = tl.closeTime != null
+        ? new Date(tl.closeTime).toISOString()
+        : (t.close_time != null ? new Date(typeof t.close_time === 'number' && t.close_time < 1e11 ? t.close_time * 1000 : t.close_time).toISOString() : null);
+
+      const status = String(t.status || (closeIso ? 'CLOSED' : 'OPEN')).toUpperCase();
+
+      const mapped = {
+        id: String(t.ticket ?? t.position_id ?? ''),
+        ticket: t.ticket,
+        position_id: t.position_id || t.ticket,
+        symbol: t.symbol || '',
+        type: sideClean || 'BUY',
+        side: sideClean || 'BUY',
+        lots: parseFloat(t.volume ?? t.lots) || 0,
+        volume: parseFloat(t.volume ?? t.lots) || 0,
+        openPrice: parseFloat(t.open_price ?? t.price) || 0,
+        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
+        open_price: parseFloat(t.open_price ?? t.price) || 0,
+        close_price: parseFloat(t.close_price ?? t.price_current) || 0,
+        pl: parseFloat(t.profit) || 0,
+        profit: parseFloat(t.profit) || 0,
+        swap: parseFloat(t.swap) || 0,
+        commission: parseFloat(t.commission) || 0,
+        openTime: openIso,
+        closeTime: closeIso,
+        open_time: openIso,
+        close_time: closeIso,
+        status,
+        comment: t.comment || '',
+        sl: parseFloat(t.sl) || 0,
+        tp: parseFloat(t.tp) || 0,
+        magic: t.magic || 0,
+      };
+
+      if (mapped.id) {
+        tradeMap.set(mapped.id, mapped);
+      }
+    }
+  }
+
+  // 2. Tambahkan transaksi balance (deposit/withdrawal) dari /deals
+  if (Array.isArray(gwDeals) && gwDeals.length > 0) {
+    const balanceTrades = extractBalanceTrades(gwDeals);
+    for (const b of balanceTrades) {
+      if (b && b.id && !tradeMap.has(b.id)) {
+        tradeMap.set(b.id, b);
+      }
+    }
+  }
+
+  // 3. Overlay live/floating positions dari /positions
+  const livePositions = gwPositions?.positions || [];
+  if (Array.isArray(livePositions) && livePositions.length > 0) {
+    for (const p of livePositions) {
+      if (!p) continue;
+      const id = String(p.ticket ?? p.position_id ?? '');
+      const openIso = p.time_msc != null
+        ? new Date(p.time_msc).toISOString()
+        : (p.time ? new Date(p.time * 1000).toISOString() : (p.open_time ? new Date(p.open_time).toISOString() : null));
+
+      const typeClean = normalizePositionType(p.type, p.side) || 'BUY';
+
+      const mappedPos = {
+        id,
+        ticket: p.ticket,
+        position_id: p.position_id || p.ticket,
+        symbol: p.symbol ?? '',
+        type: typeClean,
+        side: typeClean,
+        lots: parseFloat(p.volume ?? p.lots) || 0,
+        volume: parseFloat(p.volume ?? p.lots) || 0,
+        openPrice: parseFloat(p.price_open ?? p.open_price ?? p.price) || 0,
+        closePrice: parseFloat(p.price_current ?? p.current_price) || 0,
+        open_price: parseFloat(p.price_open ?? p.open_price ?? p.price) || 0,
+        close_price: parseFloat(p.price_current ?? p.current_price) || 0,
+        pl: parseFloat(p.profit) || 0,
+        profit: parseFloat(p.profit) || 0,
+        swap: parseFloat(p.swap) || 0,
+        commission: parseFloat(p.commission) || 0,
+        openTime: openIso,
+        closeTime: null,
+        open_time: openIso,
+        close_time: null,
+        status: 'OPEN',
+        comment: p.comment || '',
+        sl: parseFloat(p.sl) || 0,
+        tp: parseFloat(p.tp) || 0,
+      };
+
+      if (id) {
+        tradeMap.set(id, mappedPos);
+      }
+    }
+  }
+
+  // 4. Integrasikan data dari TARAPTI DB jika ada
   try {
     const { rows: akunRows } = await queryTaraptiDb(
       'SELECT id FROM akun WHERE login = $1',
@@ -597,118 +714,94 @@ export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fa
         [internalAkunId]
       );
 
-      const dbClosedTrades = closedRows.map((c) => ({
-        id: String(c.ticket),
-        symbol: c.symbol || '',
-        type: (c.side || '').toUpperCase(),
-        lots: parseFloat(c.volume) || 0,
-        openPrice: parseFloat(c.open_price) || 0,
-        closePrice: parseFloat(c.close_price) || 0,
-        pl: parseFloat(c.profit) || 0,
-        swap: parseFloat(c.swap) || 0,
-        commission: parseFloat(c.commission) || 0,
-        openTime: c.open_time ? new Date(c.open_time).toISOString() : null,
-        closeTime: c.close_time ? new Date(c.close_time).toISOString() : null,
-        status: 'CLOSED',
-        comment: c.comment || '',
-      }));
+      for (const c of closedRows || []) {
+        const id = String(c.ticket);
+        if (!tradeMap.has(id)) {
+          tradeMap.set(id, {
+            id,
+            ticket: c.ticket,
+            position_id: c.position_id || c.ticket,
+            symbol: c.symbol || '',
+            type: (c.side || 'BUY').toUpperCase(),
+            side: (c.side || 'BUY').toUpperCase(),
+            lots: parseFloat(c.volume) || 0,
+            volume: parseFloat(c.volume) || 0,
+            openPrice: parseFloat(c.open_price) || 0,
+            closePrice: parseFloat(c.close_price) || 0,
+            open_price: parseFloat(c.open_price) || 0,
+            close_price: parseFloat(c.close_price) || 0,
+            pl: parseFloat(c.profit) || 0,
+            profit: parseFloat(c.profit) || 0,
+            swap: parseFloat(c.swap) || 0,
+            commission: parseFloat(c.commission) || 0,
+            openTime: c.open_time ? new Date(c.open_time).toISOString() : null,
+            closeTime: c.close_time ? new Date(c.close_time).toISOString() : null,
+            open_time: c.open_time ? new Date(c.open_time).toISOString() : null,
+            close_time: c.close_time ? new Date(c.close_time).toISOString() : null,
+            status: 'CLOSED',
+            comment: c.comment || '',
+          });
+        }
+      }
 
-      const dbBalanceOps = balanceRows.map((op) => ({
-        id: String(op.ticket),
-        symbol: '',
-        type: 'BALANCE',
-        lots: 0,
-        openPrice: 0,
-        closePrice: 0,
-        pl: parseFloat(op.amount) || 0,
-        swap: 0,
-        commission: 0,
-        openTime: op.time ? new Date(op.time).toISOString() : null,
-        closeTime: op.time ? new Date(op.time).toISOString() : null,
-        status: 'CLOSED',
-        comment: op.comment || op.op_type || '',
-      }));
-
-      dbTrades = [...dbClosedTrades, ...dbBalanceOps];
+      for (const op of balanceRows || []) {
+        const id = String(op.ticket);
+        if (!tradeMap.has(id)) {
+          const timeIso = op.time ? new Date(op.time).toISOString() : null;
+          tradeMap.set(id, {
+            id,
+            symbol: '',
+            type: 'BALANCE',
+            side: 'BALANCE',
+            lots: 0,
+            openPrice: 0,
+            closePrice: 0,
+            pl: parseFloat(op.amount) || 0,
+            profit: parseFloat(op.amount) || 0,
+            swap: 0,
+            commission: 0,
+            openTime: timeIso,
+            closeTime: timeIso,
+            open_time: timeIso,
+            close_time: timeIso,
+            status: 'CLOSED',
+            comment: op.comment || op.op_type || '',
+          });
+        }
+      }
     }
   } catch (err) {
-    console.warn('[MT5] Gagal fetch data dari TARAPTI DB, lanjut dengan snapshot/live:', err.message);
+    // Non-fatal
   }
 
-  // 2. Build open/floating positions from live /positions endpoint (real-time profit)
-  //    Fallback to /trades OPEN entries, then snapshot.
-  let openTrades = [];
-  const livePositions = gwPositions?.positions || [];
-  if (livePositions.length > 0) {
-    // Primary: use /positions for accurate live profit, swap, currentPrice
-    openTrades = livePositions.map((p) => ({
-      id: String(p.ticket ?? ''),
-      symbol: p.symbol ?? '',
-      type: normalizePositionType(p.type, p.side),
-      lots: parseFloat(p.volume ?? p.lots) || 0,
-      openPrice: parseFloat(p.price_open ?? p.open_price ?? p.price) || 0,
-      closePrice: parseFloat(p.price_current ?? p.current_price) || 0,
-      pl: parseFloat(p.profit) || 0,
-      swap: parseFloat(p.swap) || 0,
-      commission: parseFloat(p.commission) || 0,
-      openTime: p.time ? new Date(p.time * 1000).toISOString() : (p.open_time ? new Date(p.open_time).toISOString() : null),
-      closeTime: null,  // always null — these are open positions
-      status: 'OPEN',
-      comment: p.comment || '',
-    }));
-  } else if (gwTrades && gwTrades.trades) {
-    // Fallback: filter OPEN entries from /trades endpoint
-    const timeline = buildDealTimeline(gwDeals || []);
-    const regularTrades = (gwTrades.trades || []).map((t) => {
-      const tl = timeline[t.ticket] || {};
-      return {
-        id: String(t.ticket ?? ''),
-        symbol: t.symbol ?? '',
-        type: normalizeOrderType(t.type ?? t.side),
-        lots: parseFloat(t.volume ?? t.lots) || 0,
-        openPrice: parseFloat(t.open_price ?? t.price) || 0,
-        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
-        pl: parseFloat(t.profit) || 0,
-        swap: parseFloat(t.swap) || 0,
-        commission: parseFloat(t.commission) || 0,
-        openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
-        closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
-        status: String(t.status || 'CLOSED').toUpperCase(),
-      };
-    });
-    openTrades = regularTrades.filter((t) => t.status === 'OPEN' || !t.closeTime);
-  } else {
-    // Last resort: use snapshot
+  // 5. Fallback ke snapshot Supabase jika tradeMap masih kosong (misal Gateway offline)
+  if (tradeMap.size === 0) {
     const sourceTrades = fallbackTrades || row.snapshot?.trades || [];
-    openTrades = sourceTrades.filter((t) => t.status === 'OPEN' || !t.closeTime);
-  }
-
-  // 3. Combine & Deduplicate by ticket ID
-  // DB closed trades go in first; open trades overlay/replace any stale entries
-  const tradeMap = new Map();
-  for (const t of dbTrades) {
-    tradeMap.set(t.id, t);
-  }
-  for (const t of openTrades) {
-    tradeMap.set(t.id, t);
+    if (Array.isArray(sourceTrades)) {
+      for (const t of sourceTrades) {
+        if (t && (t.id || t.ticket)) {
+          tradeMap.set(String(t.id || t.ticket), t);
+        }
+      }
+    }
   }
 
   const merged = Array.from(tradeMap.values());
 
-  // 4. Sort: most recent first
+  // 6. Urutkan transaksi terbaru di paling atas
   merged.sort((a, b) => {
-    const timeA = new Date(a.closeTime || a.openTime || 0).getTime();
-    const timeB = new Date(b.closeTime || b.openTime || 0).getTime();
+    const timeA = new Date(a.closeTime || a.openTime || a.close_time || a.open_time || 0).getTime();
+    const timeB = new Date(b.closeTime || b.openTime || b.close_time || b.open_time || 0).getTime();
     return timeB - timeA;
   });
 
-  console.log(`[MT5-MERGE] dbTrades: ${dbTrades.length}, livePositions: ${livePositions.length}, openTradesFallback: ${openTrades.length - livePositions.length}, merged: ${merged.length}`);
+  console.log(`[MT5-MERGE] Total trades gabungan: ${merged.length} untuk akun ${row.akun_id}`);
   return merged;
 }
 
 export async function listMyTrades(userId, optsOrAkunId = {}) {
   const row = await getMyAkunRow(userId, optsOrAkunId);
-  if (!row) return { trades: [] };
+  if (!row) return { trades: [], live: false, count: 0 };
 
   const limitNum = typeof optsOrAkunId === 'object' && optsOrAkunId !== null
     ? (Number(optsOrAkunId.limit) || 2000)
@@ -716,29 +809,31 @@ export async function listMyTrades(userId, optsOrAkunId = {}) {
   let gwTrades = null;
   let gwDeals = [];
   let gwPositions = null;
+  let isLive = false;
   const creds = getAccountCredentials(row);
 
   if (creds && row.credential_saved) {
-    // Fetch /trades, /deals, and /positions in parallel for speed
+    // Fetch /trades, /deals, dan /positions secara paralel
     const [tradesResult, dealsResult, positionsResult] = await Promise.allSettled([
       getTrades(creds),
       getDeals(creds),
       getPositions(creds),
     ]);
 
-    if (tradesResult.status === 'fulfilled') {
+    if (tradesResult.status === 'fulfilled' && tradesResult.value) {
       gwTrades = tradesResult.value;
+      isLive = true;
     } else {
       console.warn('[MT5] Gagal ambil /trades dari gateway, fallback ke snapshot:', tradesResult.reason?.message);
     }
 
-    if (dealsResult.status === 'fulfilled') {
+    if (dealsResult.status === 'fulfilled' && dealsResult.value) {
       gwDeals = dealsResult.value?.deals || [];
     } else {
       console.warn('[MT5] Gagal ambil /deals, lanjut tanpa timeline:', dealsResult.reason?.message);
     }
 
-    if (positionsResult.status === 'fulfilled') {
+    if (positionsResult.status === 'fulfilled' && positionsResult.value) {
       gwPositions = positionsResult.value;
       console.log(`[MT5-POS] Live positions fetched: ${gwPositions?.count ?? gwPositions?.positions?.length ?? 0}`);
     } else {
@@ -747,26 +842,35 @@ export async function listMyTrades(userId, optsOrAkunId = {}) {
   }
 
   if (gwTrades) {
-    await syncTradesToTaraptiDb(row, gwTrades, gwDeals);
+    syncTradesToTaraptiDb(row, gwTrades, gwDeals).catch((e) =>
+      console.warn('[MT5] Gagal sync trades ke TARAPTI DB:', e.message)
+    );
   }
 
   const trades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, null, gwPositions);
 
-  // Update snapshot asynchronously for offline fallback purposes
-  supabase
-    .from('user_mt5_accounts')
-    .update({
-      snapshot: {
-        ...row.snapshot,
-        trades,
-        fetched_at: new Date().toISOString(),
-      },
-    })
-    .eq('id', row.id)
-    .then(() => {})
-    .catch((e) => console.warn('[MT5] Gagal update snapshot trades:', e.message));
+  // Update snapshot HANYA jika data trades valid berhasil didapatkan atau saat live
+  if (trades.length > 0) {
+    supabase
+      .from('user_mt5_accounts')
+      .update({
+        snapshot: {
+          ...row.snapshot,
+          trades,
+          fetched_at: new Date().toISOString(),
+        },
+      })
+      .eq('id', row.id)
+      .then(() => {})
+      .catch((e) => console.warn('[MT5] Gagal update snapshot trades:', e.message));
+  }
 
-  return { trades: trades.slice(0, limitNum) };
+  return {
+    trades: trades.slice(0, limitNum),
+    live: isLive,
+    count: trades.length,
+    fetched_at: row.snapshot?.fetched_at || new Date().toISOString(),
+  };
 }
 
 export async function ensureUserExists(userId, email) {

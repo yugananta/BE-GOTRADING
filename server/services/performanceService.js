@@ -285,17 +285,41 @@ export async function backfillAllAccountsPerformance() {
       return;
     }
 
+    const { getAccountCredentials, getMergedTradesFromDbAndGateway } = await import('./metatraderService.js');
+    const { getTrades, getDeals } = await import('../integrations/mt5-gateway/client.js');
+
     for (const acc of accounts) {
-      const metrics = await calculateAccountPerformance(acc);
+      let gwTrades = null;
+      let gwDeals = [];
+      const creds = getAccountCredentials(acc);
+
+      // Jika trades kosong di snapshot dan credential tersimpan, fetch dari Gateway
+      if (creds && acc.credential_saved && (!acc.snapshot?.trades || acc.snapshot.trades.length === 0)) {
+        try {
+          const [tRes, dRes] = await Promise.allSettled([
+            getTrades(creds),
+            getDeals(creds),
+          ]);
+          if (tRes.status === 'fulfilled' && tRes.value) gwTrades = tRes.value;
+          if (dRes.status === 'fulfilled' && dRes.value) gwDeals = dRes.value?.deals || [];
+        } catch (e) {
+          console.warn(`[PERF-BACKFILL] Gagal fetch live trades untuk akun ${acc.akun_id}:`, e.message);
+        }
+      }
+
+      const mergedTrades = await getMergedTradesFromDbAndGateway(acc, gwTrades, gwDeals, acc.snapshot?.trades);
+      const metrics = await calculateAccountPerformance(acc, null, gwDeals, mergedTrades);
       console.log(`[PERF-BACKFILL] Akun ${acc.akun_id} (${acc.server}): ` +
         `Deposit=$${metrics.total_deposit}, Withdrawal=$${metrics.total_withdrawal}, ` +
         `Peak=$${metrics.peak_equity}, CurrentEquity=$${acc.snapshot?.account?.equity ?? acc.equity ?? 0}, ` +
-        `TotalPnL=$${metrics.total_pnl}, Perf=${metrics.performance_pct}%, DD=${metrics.drawdown_pct}%`);
+        `TotalPnL=$${metrics.total_pnl}, Perf=${metrics.performance_pct}%, DD=${metrics.drawdown_pct}%, Trades=${mergedTrades.length}`);
 
       const updatedSnapshotAccount = {
         ...(acc.snapshot?.account || {}),
         ...metrics,
       };
+
+      const finalTrades = mergedTrades.length > 0 ? mergedTrades : (acc.snapshot?.trades || []);
 
       await supabase
         .from('user_mt5_accounts')
@@ -307,6 +331,8 @@ export async function backfillAllAccountsPerformance() {
           snapshot: {
             ...acc.snapshot,
             account: updatedSnapshotAccount,
+            trades: finalTrades,
+            fetched_at: new Date().toISOString(),
           }
         })
         .eq('id', acc.id);
