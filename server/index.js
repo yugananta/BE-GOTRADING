@@ -43,9 +43,41 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception (server tetap jalan):', err);
 });
 
-const allowedOrigins = [FRONTEND_URL, ADMIN_FRONTEND_URL].filter((o) => o && o !== '*');
+const defaultAllowedOrigins = [
+  'https://admin.gotrading.id',
+  'https://my.gotrading.id',
+  'https://gotrading.id',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:3001',
+];
+
+const envOrigins = [FRONTEND_URL, ADMIN_FRONTEND_URL]
+  .filter((o) => o && o !== '*')
+  .flatMap((o) => o.split(',').map((s) => s.trim()));
+
+const allowedOrigins = Array.from(new Set([...defaultAllowedOrigins, ...envOrigins]));
+
 app.use(cors({
-  origin: allowedOrigins.length > 0 ? allowedOrigins : '*',
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+      return callback(null, true);
+    }
+    // Whitelist subdomain gotrading.id, localhost, atau cloud run preview
+    if (
+      /^https?:\/\/([a-z0-9-]+\.)*gotrading\.id(:[0-9]+)?$/i.test(origin) ||
+      /^https?:\/\/([a-z0-9-]+\.)*run\.app(:[0-9]+)?$/i.test(origin) ||
+      /^https?:\/\/localhost(:[0-9]+)?$/i.test(origin)
+    ) {
+      return callback(null, true);
+    }
+    return callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'X-Total-Count'],
+  exposedHeaders: ['X-Total-Count'],
 }));
 app.use(express.json());
 app.use(httpMetricsMiddleware); // STEP 14 — HTTP instrumentation (sebelum semua route)
