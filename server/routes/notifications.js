@@ -17,10 +17,10 @@ router.use(requireAuth);
 
 router.get('/', async (req, res, next) => {
   try {
-    const list = await listMyNotifications(req.user.sub);
-    const unreadCount = list.filter((n) => !n.isRead).length;
+    const result = await listMyNotifications(req.user.sub);
+    const unreadCount = result.data.filter((n) => !n.isRead).length;
     res.setHeader('X-Unread-Count', String(unreadCount));
-    res.json(list);
+    res.json(result);
   } catch (err) { next(err); }
 });
 

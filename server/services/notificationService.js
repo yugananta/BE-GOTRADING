@@ -63,6 +63,8 @@ export async function createNotification({ toUserId, fromUserId, type, message, 
   return formatNotification(data);
 }
 
+const userNotificationsCache = new Map();
+
 export async function listMyNotifications(userId) {
   const { data, error } = await supabase
     .from('notifications')
@@ -70,8 +72,25 @@ export async function listMyNotifications(userId) {
     .eq('to_user_id', userId)
     .order('created_at', { ascending: false })
     .limit(100);
-  if (error) throw error;
-  return (data || []).map(formatNotification);
+
+  if (error) {
+    console.error(`[Supabase Error] Gagal memuat notifikasi untuk user ${userId}:`, error.message || error);
+    // Silent Fallback ke in-memory cache jika query DB gagal
+    const cachedData = userNotificationsCache.get(userId) || [];
+    return {
+      data: cachedData,
+      meta: { stale: true, source: 'cache', error: error.message }
+    };
+  }
+
+  const formattedData = (data || []).map(formatNotification);
+  // Update in-memory cache
+  userNotificationsCache.set(userId, formattedData);
+
+  return {
+    data: formattedData,
+    meta: { stale: false, source: 'database' }
+  };
 }
 
 export async function getUnreadCount(userId) {

@@ -49,10 +49,12 @@ async function testNotificationsSync() {
     const listRes = await fetch(`${baseUrl}`, {
       headers: { Authorization: authHeader },
     });
-    const listData = await listRes.json();
+    const listResBody = await listRes.json();
+    const listData = listResBody.data || listResBody;
     const xUnread = listRes.headers.get('X-Unread-Count');
     console.log('  Status:', listRes.status);
     console.log(`  Found ${listData.length} notifications, Header X-Unread-Count: ${xUnread}`);
+    if (listResBody.meta) console.log('  Meta:', listResBody.meta);
     const targetInList = listData.find((n) => String(n.id) === String(notifId));
     console.log('  Target found in list:', !!targetInList, 'isRead:', targetInList?.isRead);
 
@@ -75,7 +77,8 @@ async function testNotificationsSync() {
     const refetchRes = await fetch(`${baseUrl}`, {
       headers: { Authorization: authHeader },
     });
-    const refetchData = await refetchRes.json();
+    const refetchBody = await refetchRes.json();
+    const refetchData = refetchBody.data || refetchBody;
     const targetAfterReload = refetchData.find((n) => String(n.id) === String(notifId));
     console.log('  Target notification after reload isRead:', targetAfterReload?.isRead);
     if (targetAfterReload?.isRead !== true) throw new Error('isRead should remain true after reload');
