@@ -38,11 +38,32 @@ router.get('/leaderboard', async (req, res, next) => {
 // ?search=, ?city=, atau ?province=, bukan /api/users/search.
 router.get('/', async (req, res, next) => {
   try {
-    const { search, city, province } = req.query;
-    if (city || province) {
-      return res.json(await searchUsersByLocation({ city, province }));
+    const { search, city, province, country, page, limit, paginate } = req.query;
+    const pageNum = page ? Math.max(1, parseInt(page, 10)) : 1;
+    const limitNum = limit ? Math.min(100, Math.max(1, parseInt(limit, 10))) : 20;
+
+    if (city || province || country) {
+      const result = await searchUsersByLocation({
+        city,
+        province,
+        country,
+        search,
+        page: pageNum,
+        limit: limitNum,
+      }, req.user?.sub);
+
+      res.setHeader('X-Total-Count', String(result.total));
+
+      // Jika frontend meminta object pagination atau mempassing parameter page
+      if (page || paginate === 'true' || paginate === '1') {
+        return res.json(result);
+      }
+
+      // Backward compatibility: jika pemanggil lama mengharapkan array murni
+      return res.json(result.members);
     }
-    res.json(await searchUsers(search || '', 50));
+
+    res.json(await searchUsers(search || '', limitNum));
   } catch (err) { next(err); }
 });
 

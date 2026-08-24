@@ -1,5 +1,6 @@
 // server/services/profileService.js
 import { supabase } from '../integrations/supabase/client.js';
+import { getGroupMembers } from './communityService.js';
 
 const PUBLIC_FIELDS = 'id, full_name, username, email, whatsapp, country, province, city, avatar_url, bio, role, ib_region, verification_status, status, locale, created_at';
 
@@ -68,13 +69,18 @@ export async function updateLanguage(userId, language) {
 }
 
 // Dipakai GroupView.tsx untuk menyarankan trader di kota/provinsi yang sama.
-export async function searchUsersByLocation({ city, province }, limit = 50) {
-  let query = supabase.from('users').select(PUBLIC_FIELDS);
-  if (city) query = query.eq('city', city);
-  else if (province) query = query.eq('province', province);
-  const { data, error } = await query.limit(limit);
-  if (error) throw error;
-  return data || [];
+// Dilengkapi pagination & batch query untuk mencegah N+1.
+export async function searchUsersByLocation({ city, province, country, page = 1, limit = 20, search }, viewerId) {
+  const result = await getGroupMembers({
+    city,
+    province,
+    country,
+    search,
+    page,
+    limit,
+    viewerId,
+  });
+  return result;
 }
 
 export async function searchUsers(keyword, limit = 20) {

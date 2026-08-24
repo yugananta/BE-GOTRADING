@@ -6,7 +6,7 @@
 import { Router } from 'express';
 import { requireAuth } from '../middleware/requireAuth.js';
 import {
-  getOrCreateGroup, listGroups, getMessages, postMessage,
+  getOrCreateGroup, listGroups, getMessages, postMessage, getGroupMembers,
 } from '../services/communityService.js';
 
 const router = Router();
@@ -40,6 +40,40 @@ router.post('/groups/:groupId/messages', async (req, res, next) => {
   try {
     const message = await postMessage(req.params.groupId, req.user.sub, req.body.body);
     res.status(201).json(message);
+  } catch (err) { next(err); }
+});
+
+// GroupView.tsx: Ambil daftar anggota grup spesifik terpaginasi
+router.get('/groups/:groupId/members', async (req, res, next) => {
+  try {
+    const { page, limit, search } = req.query;
+    const result = await getGroupMembers({
+      groupId: req.params.groupId,
+      search,
+      page: page ? parseInt(page, 10) : 1,
+      limit: limit ? parseInt(limit, 10) : 20,
+      viewerId: req.user?.sub,
+    });
+    res.setHeader('X-Total-Count', String(result.total));
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// GroupView.tsx: Ambil daftar anggota berdasarkan filter lokasi
+router.get('/members', async (req, res, next) => {
+  try {
+    const { city, province, country, search, page, limit } = req.query;
+    const result = await getGroupMembers({
+      city,
+      province,
+      country,
+      search,
+      page: page ? parseInt(page, 10) : 1,
+      limit: limit ? parseInt(limit, 10) : 20,
+      viewerId: req.user?.sub,
+    });
+    res.setHeader('X-Total-Count', String(result.total));
+    res.json(result);
   } catch (err) { next(err); }
 });
 
