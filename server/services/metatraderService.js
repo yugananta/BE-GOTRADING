@@ -1,0 +1,1498 @@
+// server/services/metatraderService.js
+//
+// Endpoint MT5 yang dipanggil LANGSUNG oleh user (bukan admin) --
+// AppContext.tsx: fetchMetaTraderData, syncMetaTrader, connectBroker,
+// disconnectBroker.
+//
+// ARSITEKTUR MT5 GATEWAY STATELESS (sequential queue):
+//   - MT5 Gateway (Python) beroperasi secara STATELESS dengan antrean sekuensial.
+//     Setiap request data (/account, /trades, /positions, /deals, /orders)
+//     menerima kredensial terdekripsi { login, password, server, broker }
+//     melalui method POST dan header X-API-Key.
+//   - Supabase `user_mt5_accounts` menyimpan data akun & password investor
+//     terenkripsi (password_enc) menggunakan AES-256.
+//   - Tidak ada lagi keterbatasan 1 sesi untuk seluruh sistem: setiap akun MT5
+//     milik setiap user dapat diakses dan berstatus CONNECTED secara mandiri.
+
+import { supabase } from '../integrations/supabase/client.js';
+import { queryTaraptiDb } from '../integrations/tarapti-db/pool.js';
+import {
+  getAccount,
+  getPositions,
+  getOrders,
+  getTrades,
+  getDeals,
+  getGatewayState,
+  gatewayConnect,
+  gatewayDisconnect,
+  normalizeConnectResult,
+} from '../integrations/mt5-gateway/client.js';
+import { encryptPassword, decryptPassword } from './mt5CredentialStore.js';
+import { recordEquitySnapshot, calculateAccountPerformance } from './performanceService.js';
+
+const GATEWAY_UNAVAILABLE_MSG = 'MT5 Gateway tidak tersedia atau tidak dapat dihubungi';
+
+// Status koneksi yang dipakai di kolom `conn_status`.
+export const CONN_STATUS = {
+  CONNECTED: 'connected',
+  RECONNECTING: 'reconnecting',
+  DISCONNECTED: 'disconnected',
+  ERROR: 'error',
+};
+
+export function normalizeOrderType(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number') {
+    switch (val) {
+      case 0: return 'BUY';
+      case 1: return 'SELL';
+      case 2: return 'BUY_LIMIT';
+      case 3: return 'SELL_LIMIT';
+      case 4: return 'BUY_STOP';
+      case 5: return 'SELL_STOP';
+      case 6: return 'BUY_STOP_LIMIT';
+      case 7: return 'SELL_STOP_LIMIT';
+      default: return String(val).toUpperCase();
+    }
+  }
+  const str = String(val).trim().toUpperCase();
+  if (str === '0') return 'BUY';
+  if (str === '1') return 'SELL';
+  return str;
+}
+
+export function normalizePositionType(type, side) {
+  const val = type ?? side ?? '';
+  return normalizeOrderType(val);
+}
+
+export function normalizeDealType(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number') {
+    switch (val) {
+      case 0: return 'BUY';
+      case 1: return 'SELL';
+      case 2: return 'BALANCE';
+      case 3: return 'CREDIT';
+      case 4: return 'CHARGE';
+      case 5: return 'CORRECTION';
+      case 6: return 'BONUS';
+      case 7: return 'COMMISSION';
+      default: return String(val).toUpperCase();
+    }
+  }
+  const str = String(val).trim().toUpperCase();
+  if (str === '0') return 'BUY';
+  if (str === '1') return 'SELL';
+  if (str === '2' || str === 'DEAL_TYPE_BALANCE') return 'BALANCE';
+  return str;
+}
+
+export function mapBalanceDealToTrade(d) {
+  if (!d) return null;
+  const timeIso = d.time_msc != null
+    ? new Date(d.time_msc).toISOString()
+    : (d.time ? new Date(d.time * 1000).toISOString() : (d.time_setup ? new Date(d.time_setup).toISOString() : null));
+  return {
+    id: String(d.ticket ?? d.order ?? ''),
+    symbol: d.symbol || '',
+    type: 'BALANCE',
+    lots: parseFloat(d.volume) || 0,
+    openPrice: parseFloat(d.price) || 0,
+    closePrice: parseFloat(d.price) || 0,
+    pl: parseFloat(d.profit) || 0,
+    swap: parseFloat(d.swap) || 0,
+    commission: parseFloat(d.commission) || 0,
+    openTime: timeIso,
+    closeTime: timeIso,
+    status: 'CLOSED',
+    comment: d.comment || '',
+  };
+}
+
+export function extractBalanceTrades(deals) {
+  if (!Array.isArray(deals)) return [];
+  return deals
+    .filter((d) => {
+      if (!d) return false;
+      const typeStr = normalizeDealType(d.type);
+      return typeStr === 'BALANCE' || d.type === 2 || (!d.symbol && parseFloat(d.profit) !== 0);
+    })
+    .map(mapBalanceDealToTrade)
+    .filter(Boolean);
+}
+
+export function combineTradesWithBalanceDeals(trades, deals) {
+  const mappedTrades = (trades || []).map((t) => ({ ...t }));
+  const balanceTrades = extractBalanceTrades(deals);
+
+  const existingIds = new Set(mappedTrades.map((t) => t.id));
+  for (const b of balanceTrades) {
+    if (b.id && !existingIds.has(b.id)) {
+      mappedTrades.push(b);
+      existingIds.add(b.id);
+    } else if (!b.id) {
+      mappedTrades.push(b);
+    }
+  }
+
+  // Urutkan transaksi terbaru di atas berdasarkan closeTime / openTime
+  mappedTrades.sort((a, b) => {
+    const timeA = new Date(a.closeTime || a.openTime || 0).getTime();
+    const timeB = new Date(b.closeTime || b.openTime || 0).getTime();
+    return timeB - timeA;
+  });
+
+  return mappedTrades;
+}
+
+function isAuthError(err) {
+  if (!err) return false;
+  // HTTP 400 dari gateway Python bisa berisi pesan non-auth seperti
+  // "'NoneType' object has no attribute 'connected'" -- jangan diklasifikasikan
+  // sebagai auth error. Hanya status 401 yang selalu auth error.
+  if (err.status === 401) return true;
+  if (err.status !== 400 && err.status !== 422) return false;
+  const msg = String(err.message || err.body?.detail || err.body?.error || '').toLowerCase();
+  return /invalid_user_or_password|invalid login|invalid password|wrong password|authentication failed|auth_failed|login failed|password incorrect|no connection|authorization failed/i.test(msg);
+}
+
+export function getAccountCredentials(row, plainPassword = null) {
+  if (!row) return null;
+  let password = plainPassword;
+  if (!password && row.password_enc) {
+    try {
+      password = decryptPassword(row.password_enc);
+    } catch (e) {
+      console.warn('[MT5] Gagal mendekripsi password_enc untuk akun', row.akun_id, e.message);
+    }
+  }
+  if (!password) return null;
+  return {
+    login: Number(row.akun_id),
+    password,
+    server: row.server || row.snapshot?.requested_server || 'Axi-US50-Demo',
+    broker: row.broker || row.snapshot?.requested_broker || 'Axi',
+  };
+}
+
+async function getMyAkunRow(userId, akunIdOrOpts = null) {
+  let target = akunIdOrOpts;
+  if (target && typeof target === 'object') {
+    target = target.akunId ?? target.login ?? target.accountId ?? target.id ?? null;
+  }
+
+  if (target !== null && target !== undefined && String(target).trim() !== '') {
+    const rawStr = String(target).trim();
+    const num = Number(rawStr);
+
+    if (Number.isFinite(num)) {
+      // 1. Coba cari berdasarkan MT5 login (kolom akun_id)
+      const { data: byAkunId, error: err1 } = await supabase
+        .from('user_mt5_accounts')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('akun_id', num)
+        .maybeSingle();
+
+      if (err1 && err1.code === 'PGRST205') {
+        const err = new Error(
+          'Tabel user_mt5_accounts belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+        );
+        err.status = 503;
+        throw err;
+      }
+      if (byAkunId) return byAkunId;
+
+      // 2. Coba cari berdasarkan DB Row Primary Key (kolom id)
+      const { data: byId, error: err2 } = await supabase
+        .from('user_mt5_accounts')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('id', num)
+        .maybeSingle();
+
+      if (err2 && err2.code === 'PGRST205') {
+        const err = new Error(
+          'Tabel user_mt5_accounts belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+        );
+        err.status = 503;
+        throw err;
+      }
+      if (byId) return byId;
+    } else {
+      // 3. String / UUID id lookup
+      const { data: byStrId, error: err3 } = await supabase
+        .from('user_mt5_accounts')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('id', rawStr)
+        .maybeSingle();
+
+      if (err3 && err3.code === 'PGRST205') {
+        const err = new Error(
+          'Tabel user_mt5_accounts belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+        );
+        err.status = 503;
+        throw err;
+      }
+      if (byStrId) return byStrId;
+    }
+  }
+
+  // Fallback tanpa akun spesifik: ambil akun paling baru dibuat milik user ini
+  const { data, error } = await supabase
+    .from('user_mt5_accounts')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    if (error.code === 'PGRST205') {
+      const err = new Error(
+        'Tabel user_mt5_accounts belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+      );
+      err.status = 503;
+      throw err;
+    }
+    throw error;
+  }
+  return data || null;
+}
+
+// Konversi payload GET /account dari gateway ke bentuk yang dipakai FE.
+function mapGatewayAccount(gw, stored, performanceMetrics = null) {
+  const toNum = (v) => {
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const storedConn = stored?.conn_status;
+  const connStatus = storedConn
+    || (stored?.status === 'connected' ? CONN_STATUS.CONNECTED : CONN_STATUS.DISCONNECTED);
+
+  const totalDeposit = toNum(performanceMetrics?.total_deposit ?? performanceMetrics?.totalDeposit ?? stored?.snapshot?.account?.total_deposit ?? stored?.snapshot?.account?.totalDeposit ?? stored?.total_deposit);
+  const totalWithdrawal = toNum(performanceMetrics?.total_withdrawal ?? performanceMetrics?.totalWithdrawal ?? stored?.snapshot?.account?.total_withdrawal ?? stored?.snapshot?.account?.totalWithdrawal ?? stored?.total_withdrawal);
+  const initialDeposit = toNum(performanceMetrics?.initial_deposit ?? performanceMetrics?.initialDeposit ?? stored?.snapshot?.account?.initial_deposit ?? stored?.snapshot?.account?.initialDeposit ?? stored?.initial_deposit ?? totalDeposit);
+  const peakEquity = toNum(performanceMetrics?.peak_equity ?? performanceMetrics?.peakEquity ?? stored?.snapshot?.account?.peak_equity ?? stored?.snapshot?.account?.peakEquity ?? stored?.peak_equity);
+  const totalPnl = toNum(performanceMetrics?.total_pnl ?? performanceMetrics?.totalPnl ?? stored?.snapshot?.account?.total_pnl ?? stored?.snapshot?.account?.totalPnl ?? stored?.total_pnl);
+  const performancePct = toNum(performanceMetrics?.performance_pct ?? performanceMetrics?.performancePct ?? stored?.snapshot?.account?.performance_pct ?? stored?.snapshot?.account?.performancePct ?? stored?.performance_pct);
+  const drawdownPct = toNum(performanceMetrics?.drawdown_pct ?? performanceMetrics?.drawdownPct ?? stored?.snapshot?.account?.drawdown_pct ?? stored?.snapshot?.account?.drawdownPct ?? stored?.drawdown_pct);
+
+  return {
+    // WAJIB: id row Supabase -- dipakai frontend (Account.tsx) untuk
+    // handleDisconnect(activeAccount.id) supaya disconnect hanya memutus
+    // akun yang dipilih, bukan semua akun user. Tanpa ini, disconnect akan
+    // mengirim accountId=undefined dan memutus SEMUA akun sekaligus.
+    id: stored?.id ?? null,
+    akunId: stored?.akun_id ?? toNum(gw?.login),
+    login: String(stored?.akun_id ?? gw?.login ?? ''),
+    server: gw?.server ?? stored?.server ?? stored?.snapshot?.requested_server ?? 'Axi-US50-Demo',
+    broker: gw?.broker ?? stored?.broker ?? stored?.snapshot?.requested_broker ?? 'Axi',
+    platform: stored?.platform || 'MT5',
+    accountType: null,
+    currency: gw?.currency ?? 'USD',
+    leverage: toNum(gw?.leverage || 100),
+    status: stored?.status || 'connected',
+    conn_status: connStatus,
+    error_message: stored?.error_message || null,
+    last_connected_at: stored?.last_connected_at || null,
+    credential_saved: stored?.credential_saved !== undefined ? Boolean(stored.credential_saved) : false,
+    updated_at: stored?.updated_at || null,
+    fetched_at: stored?.snapshot?.fetched_at || stored?.updated_at || null,
+    balance: toNum(gw?.balance),
+    equity: toNum(gw?.equity),
+    profit: toNum(gw?.profit),
+    margin: toNum(gw?.margin),
+    freeMargin: toNum(gw?.margin_free),
+    marginLevel: toNum(gw?.margin_level),
+
+    // Metrik performa portofolio & drawdown riil
+    totalDeposit,
+    totalWithdrawal,
+    initialDeposit,
+    peakEquity,
+    totalPnl,
+    performancePct,
+    drawdownPct,
+
+    // snake_case aliases
+    total_deposit: totalDeposit,
+    total_withdrawal: totalWithdrawal,
+    initial_deposit: initialDeposit,
+    peak_equity: peakEquity,
+    total_pnl: totalPnl,
+    performance_pct: performancePct,
+    drawdown_pct: drawdownPct,
+  };
+}
+
+// Bangun peta ticket/position -> waktu entry/exit dari GET /deals.
+function buildDealTimeline(deals) {
+  const byPosition = {};
+  for (const d of deals || []) {
+    if (!d || d.type === 2) continue; // DEAL_TYPE_BALANCE, bukan trade
+    const key = d.position_id || d.order || d.ticket;
+    if (!key) continue;
+    const ms = d.time_msc || (d.time ? d.time * 1000 : null);
+    if (ms == null) continue;
+    byPosition[key] = byPosition[key] || {};
+    if (d.entry === 0) {
+      if (byPosition[key].openTime == null || ms < byPosition[key].openTime) {
+        byPosition[key].openTime = ms;
+      }
+    } else if (d.entry === 1) {
+      if (byPosition[key].closeTime == null || ms > byPosition[key].closeTime) {
+        byPosition[key].closeTime = ms;
+      }
+    }
+  }
+  return byPosition;
+}
+
+export async function getMyAccount(userId, akunId = null) {
+  const row = await getMyAkunRow(userId, akunId);
+  if (!row) return { account: null };
+
+  let gw = null;
+  let live = false;
+  let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
+  const creds = getAccountCredentials(row);
+  let perfMetrics = null;
+
+  if (creds && row.credential_saved && connStatus !== CONN_STATUS.DISCONNECTED) {
+    try {
+      const liveGw = await getAccount(creds);
+      if (liveGw && (liveGw.login != null || liveGw.balance !== undefined)) {
+        gw = liveGw;
+        live = true;
+        connStatus = CONN_STATUS.CONNECTED;
+
+        // Record equity snapshot & calculate real performance metrics
+        await recordEquitySnapshot(row, liveGw);
+        perfMetrics = await calculateAccountPerformance(row, liveGw);
+
+        supabase
+          .from('user_mt5_accounts')
+          .update({
+            conn_status: CONN_STATUS.CONNECTED,
+            status: 'connected',
+            last_connected_at: new Date().toISOString(),
+            error_message: null,
+            reconnect_attempts: 0,
+            next_reconnect_at: null,
+            peak_equity: perfMetrics.peak_equity,
+            total_deposit: perfMetrics.total_deposit,
+            total_withdrawal: perfMetrics.total_withdrawal,
+            initial_deposit: perfMetrics.initial_deposit,
+            snapshot: {
+              ...row.snapshot,
+              account: {
+                ...gw,
+                ...perfMetrics,
+              },
+              fetched_at: new Date().toISOString(),
+            },
+          })
+          .eq('id', row.id)
+          .then(() => {})
+          .catch(() => {});
+      }
+    } catch (err) {
+      console.warn('[MT5] getAccount failed in getMyAccount:', err.message);
+      if (isAuthError(err)) {
+        connStatus = CONN_STATUS.ERROR;
+        supabase
+          .from('user_mt5_accounts')
+          .update({
+            conn_status: CONN_STATUS.ERROR,
+            error_message: err.message || 'Credential MT5 invalid atau kedaluwarsa',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', row.id)
+          .then(() => {})
+          .catch(() => {});
+      } else if (err.status === 504 || err.status === 503) {
+        connStatus = CONN_STATUS.RECONNECTING;
+      }
+    }
+  }
+
+  const fallback = row.snapshot?.account || {
+    login: row.akun_id,
+    server: row.server || row.snapshot?.requested_server || 'Axi-US50-Demo',
+    broker: row.broker || row.snapshot?.requested_broker || 'Axi',
+    balance: 0,
+    equity: 0,
+    profit: 0,
+    margin: 0,
+    margin_free: 0,
+    margin_level: 0,
+    currency: 'USD',
+    leverage: 100,
+  };
+
+  if (!perfMetrics) {
+    perfMetrics = await calculateAccountPerformance(row, gw || fallback);
+  }
+
+  const mapped = mapGatewayAccount(gw || fallback, { ...row, conn_status: connStatus }, perfMetrics);
+  return { account: mapped, live };
+}
+
+export async function syncTradesToTaraptiDb(row, gwTrades, gwDeals) {
+  if (!row || !gwTrades || !Array.isArray(gwTrades.trades)) return;
+  try {
+    let internalAkunId = null;
+    const { rows: existing } = await queryTaraptiDb(
+      'SELECT id FROM akun WHERE login = $1',
+      [row.akun_id]
+    );
+    if (existing && existing.length > 0) {
+      internalAkunId = existing[0].id;
+    } else {
+      let passwordPlain = '';
+      if (row.password_enc) {
+        passwordPlain = decryptPassword(row.password_enc) || '';
+      }
+      const { rows: inserted } = await queryTaraptiDb(
+        `INSERT INTO akun (user_id, login, password_investor, server, broker, platform, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'active')
+         RETURNING id`,
+        [
+          row.user_id,
+          row.akun_id,
+          passwordPlain,
+          row.server || 'Axi-US50-Demo',
+          row.broker || 'Axi',
+          row.platform || 'MT5'
+        ]
+      );
+      internalAkunId = inserted[0]?.id;
+    }
+
+    if (!internalAkunId) {
+      console.warn('[MT5-SYNC] Failed to find or register account in TARAPTI DB.');
+      return;
+    }
+
+    // 1. Process closed trades
+    const timeline = buildDealTimeline(gwDeals || []);
+    const regularTrades = (gwTrades.trades || []).map((t) => {
+      const tl = timeline[t.ticket] || {};
+      let sideClean = (t.type ?? t.side ?? '');
+      if (typeof sideClean === 'number') {
+        sideClean = sideClean === 0 ? 'BUY' : 'SELL';
+      } else {
+        sideClean = String(sideClean).toUpperCase();
+        if (sideClean.includes('BUY')) sideClean = 'BUY';
+        else if (sideClean.includes('SELL')) sideClean = 'SELL';
+        else sideClean = sideClean.substring(0, 4);
+      }
+
+      return {
+        ticket: t.ticket,
+        position_id: t.position_id || t.ticket,
+        symbol: t.symbol || '',
+        side: sideClean,
+        volume: parseFloat(t.volume ?? t.lots) || 0,
+        open_time: tl.openTime ? new Date(tl.openTime).toISOString() : (t.open_time ? new Date(t.open_time * 1000).toISOString() : null),
+        close_time: tl.closeTime ? new Date(tl.closeTime).toISOString() : (t.close_time ? new Date(t.close_time * 1000).toISOString() : null),
+        open_price: parseFloat(t.open_price ?? t.price) || 0,
+        close_price: parseFloat(t.close_price ?? t.price_current) || 0,
+        profit: parseFloat(t.profit) || 0,
+        swap: parseFloat(t.swap) || 0,
+        commission: parseFloat(t.commission) || 0,
+        duration_seconds: tl.openTime && tl.closeTime ? Math.max(0, Math.floor((new Date(tl.closeTime) - new Date(tl.openTime)) / 1000)) : 0,
+        sl: parseFloat(t.sl) || 0,
+        tp: parseFloat(t.tp) || 0,
+        magic_number: t.magic || 0,
+        comment: t.comment || '',
+        open_time_source: tl.openTime ? 'deal' : 'trade',
+        deal_entry_type: 1,
+        is_partial: false,
+      };
+    });
+
+    const closedTradesOnly = regularTrades.filter((t) => t.close_time);
+
+    // Sync closed trades
+    for (const t of closedTradesOnly) {
+      await queryTaraptiDb(
+        `INSERT INTO closed_trades 
+         (ticket, akun_id, position_id, symbol, side, volume, open_time, close_time, open_price, close_price, profit, swap, commission, duration_seconds, sl, tp, magic_number, comment, open_time_source, deal_entry_type, is_partial)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+         ON CONFLICT (ticket) DO UPDATE SET
+           close_time = EXCLUDED.close_time,
+           close_price = EXCLUDED.close_price,
+           profit = EXCLUDED.profit,
+           swap = EXCLUDED.swap,
+           commission = EXCLUDED.commission,
+           comment = EXCLUDED.comment,
+           synced_at = NOW()`,
+        [
+          t.ticket, internalAkunId, t.position_id, t.symbol, t.side, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.profit, t.swap, t.commission, t.duration_seconds, t.sl, t.tp, t.magic_number, t.comment, t.open_time_source, t.deal_entry_type, t.is_partial
+        ]
+      );
+    }
+
+    // 2. Process balance operations
+    const balanceDeals = (gwDeals || [])
+      .filter((d) => {
+        if (!d) return false;
+        const typeStr = normalizeDealType(d.type);
+        return typeStr === 'BALANCE' || d.type === 2 || (!d.symbol && parseFloat(d.profit) !== 0);
+      })
+      .map((d) => {
+        const timeIso = d.time_msc != null
+          ? new Date(d.time_msc).toISOString()
+          : (d.time ? new Date(d.time * 1000).toISOString() : (d.time_setup ? new Date(d.time_setup).toISOString() : null));
+        return {
+          ticket: d.ticket,
+          op_type: d.comment || 'BALANCE',
+          amount: parseFloat(d.profit) || 0,
+          time: timeIso,
+          comment: d.comment || '',
+        };
+      });
+
+    for (const op of balanceDeals) {
+      await queryTaraptiDb(
+        `INSERT INTO balance_operations 
+         (ticket, akun_id, op_type, amount, time, comment)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (ticket) DO UPDATE SET
+           amount = EXCLUDED.amount,
+           comment = EXCLUDED.comment,
+           synced_at = NOW()`,
+        [
+          op.ticket, internalAkunId, op.op_type.substring(0, 30), op.amount, op.time, op.comment
+        ]
+      );
+    }
+
+    console.log(`[MT5-SYNC] Successfully synced ${closedTradesOnly.length} closed trades and ${balanceDeals.length} balance ops to TARAPTI DB.`);
+  } catch (err) {
+    console.warn('[MT5-SYNC] Warning: syncTradesToTaraptiDb failed:', err.message);
+  }
+}
+
+export async function getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, fallbackTrades = null, gwPositions = null) {
+  const tradeMap = new Map();
+
+  // 1. Primary Source: Data dari MT5 Gateway (/trades & /deals)
+  if (gwTrades && Array.isArray(gwTrades.trades) && gwTrades.trades.length > 0) {
+    const timeline = buildDealTimeline(gwDeals || []);
+    for (const t of gwTrades.trades) {
+      if (!t) continue;
+      const tl = timeline[t.ticket] || {};
+
+      let sideClean = (t.type ?? t.side ?? '');
+      if (typeof sideClean === 'number') {
+        sideClean = sideClean === 0 ? 'BUY' : 'SELL';
+      } else {
+        sideClean = String(sideClean).toUpperCase();
+        if (sideClean.includes('BUY')) sideClean = 'BUY';
+        else if (sideClean.includes('SELL')) sideClean = 'SELL';
+        else sideClean = sideClean.substring(0, 4);
+      }
+
+      const openIso = tl.openTime != null
+        ? new Date(tl.openTime).toISOString()
+        : (t.open_time != null ? new Date(typeof t.open_time === 'number' && t.open_time < 1e11 ? t.open_time * 1000 : t.open_time).toISOString() : null);
+
+      const closeIso = tl.closeTime != null
+        ? new Date(tl.closeTime).toISOString()
+        : (t.close_time != null ? new Date(typeof t.close_time === 'number' && t.close_time < 1e11 ? t.close_time * 1000 : t.close_time).toISOString() : null);
+
+      const status = String(t.status || (closeIso ? 'CLOSED' : 'OPEN')).toUpperCase();
+
+      const mapped = {
+        id: String(t.ticket ?? t.position_id ?? ''),
+        ticket: t.ticket,
+        position_id: t.position_id || t.ticket,
+        symbol: t.symbol || '',
+        type: sideClean || 'BUY',
+        side: sideClean || 'BUY',
+        lots: parseFloat(t.volume ?? t.lots) || 0,
+        volume: parseFloat(t.volume ?? t.lots) || 0,
+        openPrice: parseFloat(t.open_price ?? t.price) || 0,
+        closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
+        open_price: parseFloat(t.open_price ?? t.price) || 0,
+        close_price: parseFloat(t.close_price ?? t.price_current) || 0,
+        pl: parseFloat(t.profit) || 0,
+        profit: parseFloat(t.profit) || 0,
+        swap: parseFloat(t.swap) || 0,
+        commission: parseFloat(t.commission) || 0,
+        openTime: openIso,
+        closeTime: closeIso,
+        open_time: openIso,
+        close_time: closeIso,
+        status,
+        comment: t.comment || '',
+        sl: parseFloat(t.sl) || 0,
+        tp: parseFloat(t.tp) || 0,
+        magic: t.magic || 0,
+      };
+
+      if (mapped.id) {
+        tradeMap.set(mapped.id, mapped);
+      }
+    }
+  }
+
+  // 2. Tambahkan transaksi balance (deposit/withdrawal) dari /deals
+  if (Array.isArray(gwDeals) && gwDeals.length > 0) {
+    const balanceTrades = extractBalanceTrades(gwDeals);
+    for (const b of balanceTrades) {
+      if (b && b.id && !tradeMap.has(b.id)) {
+        tradeMap.set(b.id, b);
+      }
+    }
+  }
+
+  // 3. Overlay live/floating positions dari /positions
+  const livePositions = gwPositions?.positions || [];
+  if (Array.isArray(livePositions) && livePositions.length > 0) {
+    for (const p of livePositions) {
+      if (!p) continue;
+      const id = String(p.ticket ?? p.position_id ?? '');
+      const openIso = p.time_msc != null
+        ? new Date(p.time_msc).toISOString()
+        : (p.time ? new Date(p.time * 1000).toISOString() : (p.open_time ? new Date(p.open_time).toISOString() : null));
+
+      const typeClean = normalizePositionType(p.type, p.side) || 'BUY';
+
+      const mappedPos = {
+        id,
+        ticket: p.ticket,
+        position_id: p.position_id || p.ticket,
+        symbol: p.symbol ?? '',
+        type: typeClean,
+        side: typeClean,
+        lots: parseFloat(p.volume ?? p.lots) || 0,
+        volume: parseFloat(p.volume ?? p.lots) || 0,
+        openPrice: parseFloat(p.price_open ?? p.open_price ?? p.price) || 0,
+        closePrice: parseFloat(p.price_current ?? p.current_price) || 0,
+        open_price: parseFloat(p.price_open ?? p.open_price ?? p.price) || 0,
+        close_price: parseFloat(p.price_current ?? p.current_price) || 0,
+        pl: parseFloat(p.profit) || 0,
+        profit: parseFloat(p.profit) || 0,
+        swap: parseFloat(p.swap) || 0,
+        commission: parseFloat(p.commission) || 0,
+        openTime: openIso,
+        closeTime: null,
+        open_time: openIso,
+        close_time: null,
+        status: 'OPEN',
+        comment: p.comment || '',
+        sl: parseFloat(p.sl) || 0,
+        tp: parseFloat(p.tp) || 0,
+      };
+
+      if (id) {
+        tradeMap.set(id, mappedPos);
+      }
+    }
+  }
+
+  // 4. Integrasikan data dari TARAPTI DB jika ada
+  try {
+    const { rows: akunRows } = await queryTaraptiDb(
+      'SELECT id FROM akun WHERE login = $1',
+      [row.akun_id]
+    );
+    const internalAkunId = akunRows[0]?.id;
+    if (internalAkunId) {
+      const { rows: closedRows } = await queryTaraptiDb(
+        'SELECT * FROM closed_trades WHERE akun_id = $1',
+        [internalAkunId]
+      );
+      const { rows: balanceRows } = await queryTaraptiDb(
+        'SELECT * FROM balance_operations WHERE akun_id = $1',
+        [internalAkunId]
+      );
+
+      for (const c of closedRows || []) {
+        const id = String(c.ticket);
+        if (!tradeMap.has(id)) {
+          tradeMap.set(id, {
+            id,
+            ticket: c.ticket,
+            position_id: c.position_id || c.ticket,
+            symbol: c.symbol || '',
+            type: (c.side || 'BUY').toUpperCase(),
+            side: (c.side || 'BUY').toUpperCase(),
+            lots: parseFloat(c.volume) || 0,
+            volume: parseFloat(c.volume) || 0,
+            openPrice: parseFloat(c.open_price) || 0,
+            closePrice: parseFloat(c.close_price) || 0,
+            open_price: parseFloat(c.open_price) || 0,
+            close_price: parseFloat(c.close_price) || 0,
+            pl: parseFloat(c.profit) || 0,
+            profit: parseFloat(c.profit) || 0,
+            swap: parseFloat(c.swap) || 0,
+            commission: parseFloat(c.commission) || 0,
+            openTime: c.open_time ? new Date(c.open_time).toISOString() : null,
+            closeTime: c.close_time ? new Date(c.close_time).toISOString() : null,
+            open_time: c.open_time ? new Date(c.open_time).toISOString() : null,
+            close_time: c.close_time ? new Date(c.close_time).toISOString() : null,
+            status: 'CLOSED',
+            comment: c.comment || '',
+          });
+        }
+      }
+
+      for (const op of balanceRows || []) {
+        const id = String(op.ticket);
+        if (!tradeMap.has(id)) {
+          const timeIso = op.time ? new Date(op.time).toISOString() : null;
+          tradeMap.set(id, {
+            id,
+            symbol: '',
+            type: 'BALANCE',
+            side: 'BALANCE',
+            lots: 0,
+            openPrice: 0,
+            closePrice: 0,
+            pl: parseFloat(op.amount) || 0,
+            profit: parseFloat(op.amount) || 0,
+            swap: 0,
+            commission: 0,
+            openTime: timeIso,
+            closeTime: timeIso,
+            open_time: timeIso,
+            close_time: timeIso,
+            status: 'CLOSED',
+            comment: op.comment || op.op_type || '',
+          });
+        }
+      }
+    }
+  } catch (err) {
+    // Non-fatal
+  }
+
+  // 5. Fallback ke snapshot Supabase jika tradeMap masih kosong (misal Gateway offline)
+  if (tradeMap.size === 0) {
+    const sourceTrades = fallbackTrades || row.snapshot?.trades || [];
+    if (Array.isArray(sourceTrades)) {
+      for (const t of sourceTrades) {
+        if (t && (t.id || t.ticket)) {
+          tradeMap.set(String(t.id || t.ticket), t);
+        }
+      }
+    }
+  }
+
+  const merged = Array.from(tradeMap.values());
+
+  // 6. Urutkan transaksi terbaru di paling atas
+  merged.sort((a, b) => {
+    const timeA = new Date(a.closeTime || a.openTime || a.close_time || a.open_time || 0).getTime();
+    const timeB = new Date(b.closeTime || b.openTime || b.close_time || b.open_time || 0).getTime();
+    return timeB - timeA;
+  });
+
+  console.log(`[MT5-MERGE] Total trades gabungan: ${merged.length} untuk akun ${row.akun_id}`);
+  return merged;
+}
+
+export async function listMyTrades(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
+  if (!row) return { trades: [], live: false, count: 0 };
+
+  const limitNum = typeof optsOrAkunId === 'object' && optsOrAkunId !== null
+    ? (Number(optsOrAkunId.limit) || 2000)
+    : 2000;
+  let gwTrades = null;
+  let gwDeals = [];
+  let gwPositions = null;
+  let isLive = false;
+  const creds = getAccountCredentials(row);
+
+  if (creds && row.credential_saved) {
+    // Fetch /trades, /deals, dan /positions secara paralel
+    const [tradesResult, dealsResult, positionsResult] = await Promise.allSettled([
+      getTrades(creds),
+      getDeals(creds),
+      getPositions(creds),
+    ]);
+
+    if (tradesResult.status === 'fulfilled' && tradesResult.value) {
+      gwTrades = tradesResult.value;
+      isLive = true;
+    } else {
+      console.warn('[MT5] Gagal ambil /trades dari gateway, fallback ke snapshot:', tradesResult.reason?.message);
+    }
+
+    if (dealsResult.status === 'fulfilled' && dealsResult.value) {
+      gwDeals = dealsResult.value?.deals || [];
+    } else {
+      console.warn('[MT5] Gagal ambil /deals, lanjut tanpa timeline:', dealsResult.reason?.message);
+    }
+
+    if (positionsResult.status === 'fulfilled' && positionsResult.value) {
+      gwPositions = positionsResult.value;
+      console.log(`[MT5-POS] Live positions fetched: ${gwPositions?.count ?? gwPositions?.positions?.length ?? 0}`);
+    } else {
+      console.warn('[MT5] Gagal ambil /positions, floating P&L mungkin 0:', positionsResult.reason?.message);
+    }
+  }
+
+  if (gwTrades) {
+    syncTradesToTaraptiDb(row, gwTrades, gwDeals).catch((e) =>
+      console.warn('[MT5] Gagal sync trades ke TARAPTI DB:', e.message)
+    );
+  }
+
+  const trades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals, null, gwPositions);
+
+  // Update snapshot HANYA jika data trades valid berhasil didapatkan atau saat live
+  if (trades.length > 0) {
+    supabase
+      .from('user_mt5_accounts')
+      .update({
+        snapshot: {
+          ...row.snapshot,
+          trades,
+          fetched_at: new Date().toISOString(),
+        },
+      })
+      .eq('id', row.id)
+      .then(() => {})
+      .catch((e) => console.warn('[MT5] Gagal update snapshot trades:', e.message));
+  }
+
+  return {
+    trades: trades.slice(0, limitNum),
+    live: isLive,
+    count: trades.length,
+    fetched_at: row.snapshot?.fetched_at || new Date().toISOString(),
+  };
+}
+
+export async function ensureUserExists(userId, email) {
+  const { data: existing, error: checkError } = await supabase
+    .from('users')
+    .select('id')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (checkError) {
+    if (checkError.code === 'PGRST205') {
+      const err = new Error(
+        'Tabel users belum ada. Jalankan migrasi sql/00_backend_tables.sql di Supabase SQL Editor.'
+      );
+      err.status = 503;
+      throw err;
+    }
+    throw checkError;
+  }
+
+  if (!existing) {
+    const { error: insertError } = await supabase
+      .from('users')
+      .insert({
+        id: userId,
+        email: email || `external-${userId}@tarapti.com`,
+        password_hash: 'TRUSTED_EXTERNAL_AUTH_BY_FRONTEND_PROXY',
+        verification_status: 'verified'
+      });
+    if (insertError) {
+      console.error('Failed to auto-provision user in backend:', insertError);
+      throw insertError;
+    }
+  }
+}
+
+export async function connectMyAccount(userId, { platform, login, password, server, broker }, email) {
+  await ensureUserExists(userId, email);
+
+  // Parse akun_id dengan aman -- akun MT5 seperti 81320024295 melebihi
+  // Number.MAX_SAFE_INTEGER, jadi kita harus pakai parseInt (bukan Number()).
+  const loginStr = String(login).trim().replace(/\s/g, '');
+  if (!/^\d+$/.test(loginStr)) {
+    const err = new Error('Nomor login MT5 harus berupa angka.');
+    err.status = 400;
+    throw err;
+  }
+
+  const akunId = parseInt(loginStr, 10);
+  if (!akunId || isNaN(akunId)) {
+    const err = new Error('Akun MT5 tidak terdeteksi. Silakan masukkan nomor login MT5 yang benar.');
+    err.status = 400;
+    throw err;
+  }
+
+  // Validasi: akun MT5 Axi real minimal 7 digit (ID >= 8.000.000 untuk akun
+  // lama; akun baru Axi bisa 10–11 digit seperti 81320024295).
+  // Yang diblokir: angka acak pendek < 1.000.000 (jelas bukan akun MT5).
+  if (akunId < 1_000_000) {
+    const err = new Error(`Nomor akun MT5 tidak valid (${akunId}). Pastikan login MT5 Axi Anda benar (minimal 7 digit).`);
+    err.status = 400;
+    throw err;
+  }
+
+  // PRINSIP BISNIS 1: 1 Akun MT5 TIDAK boleh dimiliki banyak profile
+  const { data: existingAccount, error: findError } = await supabase
+    .from('user_mt5_accounts')
+    .select('user_id')
+    .eq('akun_id', akunId)
+    .maybeSingle();
+
+  if (findError) throw findError;
+
+  if (existingAccount && existingAccount.user_id !== userId) {
+    const err = new Error('Akun MT5 ini sudah terhubung ke profil lain');
+    err.status = 400;
+    throw err;
+  }
+
+  const cleanServer = (server || '').trim() || null;
+  const cleanBroker = (broker || '').trim() || (cleanServer ? cleanServer.split('-')[0] : null) || 'Axi';
+  const passwordEnc = encryptPassword(password);
+
+  const credentials = {
+    login: akunId,
+    password,
+    server: cleanServer,
+    broker: cleanBroker,
+  };
+
+  let connStatus = CONN_STATUS.RECONNECTING;
+  let errorMessage = null;
+  let gwAccount = null;
+  let initialTrades = [];
+  let initialDeals = [];
+  let initialPositions = [];
+
+  try {
+    const connectRes = await gatewayConnect(credentials);
+    console.log('[GATEWAY-CALL] /connect response body:', JSON.stringify(connectRes));
+    const connectedLogin = normalizeConnectResult(connectRes);
+    if (connectedLogin && connectedLogin === akunId) {
+      connStatus = CONN_STATUS.CONNECTED;
+      gwAccount = connectRes?.account || connectRes;
+
+      // Ambil data snapshot awal
+      try {
+        const [tRes, dRes, pRes] = await Promise.allSettled([
+          getTrades(credentials),
+          getDeals(credentials),
+          getPositions(credentials),
+        ]);
+        if (tRes.status === 'fulfilled' && tRes.value?.trades) {
+          initialTrades = tRes.value.trades;
+        }
+        if (dRes.status === 'fulfilled' && dRes.value?.deals) {
+          initialDeals = dRes.value.deals;
+        }
+        if (pRes.status === 'fulfilled') {
+          const rawPos = pRes.value?.positions || pRes.value?.data || (Array.isArray(pRes.value) ? pRes.value : []);
+          initialPositions = rawPos;
+        }
+      } catch (e) {
+        console.warn('[MT5] Gagal ambil initial snapshot saat connect:', e.message);
+      }
+    } else {
+      connStatus = CONN_STATUS.RECONNECTING;
+      errorMessage = 'Koneksi sedang diproses di antrean gateway.';
+    }
+  } catch (err) {
+    console.error('[MT5-CONNECT-ERR] Gateway connect failed:', err.message, err.body || '');
+    if (isAuthError(err)) {
+      connStatus = CONN_STATUS.ERROR;
+      errorMessage = err.body?.detail || err.message || 'Credential MT5 invalid atau sudah kedaluwarsa. Silakan periksa kembali dan hubungkan ulang.';
+    } else {
+      connStatus = CONN_STATUS.RECONNECTING;
+      errorMessage = err.status === 504
+        ? 'Gateway timeout saat memproses login. Akun disimpan dan akan dicoba kembali otomatis.'
+        : (err.body?.detail || err.message || GATEWAY_UNAVAILABLE_MSG);
+    }
+  }
+
+  // 1 Profile boleh memiliki BANYAK akun MT5. Cari row yang SAMA PERSIS
+  // (user_id + akun_id) -- ini menentukan apakah kita UPDATE akun yang sudah
+  // ada, atau INSERT akun baru tanpa mengganggu akun lain milik user ini.
+  const { data: existingUserRow } = await supabase
+    .from('user_mt5_accounts')
+    .select('id, akun_id, snapshot, last_connected_at')
+    .eq('user_id', userId)
+    .eq('akun_id', akunId)
+    .maybeSingle();
+
+  const isSameAccount = Boolean(existingUserRow);
+
+  let mappedTrades = isSameAccount ? (existingUserRow?.snapshot?.trades || []) : [];
+  let mappedPositions = isSameAccount ? (existingUserRow?.snapshot?.positions || []) : [];
+
+  try {
+    if (initialTrades && initialTrades.length > 0) {
+      const timeline = buildDealTimeline(initialDeals);
+      const regularTrades = initialTrades.map((t) => {
+        const tl = timeline[t.ticket] || {};
+        return {
+          id: String(t.ticket ?? ''),
+          symbol: t.symbol ?? '',
+          type: normalizeOrderType(t.type ?? t.side),
+          lots: parseFloat(t.volume ?? t.lots) || 0,
+          openPrice: parseFloat(t.open_price ?? t.price) || 0,
+          closePrice: parseFloat(t.close_price ?? t.price_current) || 0,
+          pl: parseFloat(t.profit) || 0,
+          swap: parseFloat(t.swap) || 0,
+          commission: parseFloat(t.commission) || 0,
+          openTime: tl.openTime != null ? new Date(tl.openTime).toISOString() : null,
+          closeTime: tl.closeTime != null ? new Date(tl.closeTime).toISOString() : null,
+          status: String(t.status || 'CLOSED').toUpperCase(),
+        };
+      });
+      mappedTrades = combineTradesWithBalanceDeals(regularTrades, initialDeals);
+    } else if (initialDeals && initialDeals.length > 0) {
+      mappedTrades = extractBalanceTrades(initialDeals);
+    }
+
+    if (initialPositions && initialPositions.length > 0) {
+      mappedPositions = initialPositions.map((p) => ({
+        ticket: String(p.ticket ?? p.id ?? ''),
+        symbol: p.symbol ?? '',
+        type: normalizePositionType(p.type, p.side),
+        volume: parseFloat(p.volume ?? p.lots) || 0,
+        lots: parseFloat(p.volume ?? p.lots) || 0,
+        openPrice: parseFloat(p.open_price ?? p.price) || 0,
+        currentPrice: parseFloat(p.current_price ?? p.price_current) || 0,
+        sl: parseFloat(p.sl) || 0,
+        tp: parseFloat(p.tp) || 0,
+        profit: parseFloat(p.profit) || 0,
+        swap: parseFloat(p.swap) || 0,
+        comment: p.comment || '',
+      }));
+    }
+  } catch (snapErr) {
+    console.warn('[MT5] Gagal memproses format snapshot awal saat connect:', snapErr.message);
+  }
+
+  // Record equity snapshot & calculate initial performance metrics
+  if (connStatus === CONN_STATUS.CONNECTED && gwAccount) {
+    await recordEquitySnapshot({ akun_id: akunId }, gwAccount);
+  }
+  const perfMetrics = await calculateAccountPerformance(
+    {
+      akun_id: akunId,
+      initial_deposit: parseFloat(gwAccount?.balance) || 0,
+      snapshot: isSameAccount ? existingUserRow?.snapshot : null,
+      peak_equity: isSameAccount ? existingUserRow?.peak_equity : 0,
+    },
+    gwAccount,
+    initialDeals,
+    mappedTrades
+  );
+
+  const nowIso = new Date().toISOString();
+  const patch = {
+    status: 'connected',
+    platform: platform || 'MT5',
+    server: cleanServer,
+    broker: cleanBroker,
+    password_enc: passwordEnc,
+    credential_saved: Boolean(passwordEnc),
+    conn_status: connStatus,
+    error_message: errorMessage,
+    reconnect_attempts: 0,
+    next_reconnect_at: null,
+    peak_equity: perfMetrics.peak_equity,
+    total_deposit: perfMetrics.total_deposit,
+    total_withdrawal: perfMetrics.total_withdrawal,
+    initial_deposit: perfMetrics.initial_deposit,
+    last_connected_at: connStatus === CONN_STATUS.CONNECTED
+      ? nowIso
+      : (isSameAccount ? (existingUserRow?.last_connected_at || null) : null),
+    updated_at: nowIso,
+    snapshot: {
+      account: connStatus === CONN_STATUS.CONNECTED ? { ...gwAccount, ...perfMetrics } : (isSameAccount ? (existingUserRow?.snapshot?.account || null) : null),
+      trades: mappedTrades,
+      positions: mappedPositions.length > 0 ? mappedPositions : (isSameAccount ? (existingUserRow?.snapshot?.positions || []) : []),
+      requested_login: String(akunId),
+      requested_server: cleanServer,
+      requested_broker: cleanBroker,
+      fetched_at: nowIso,
+    },
+  };
+
+  // Credential invalid pada percobaan PERTAMA: jangan sampai membuat baris
+  // akun di database -- user belum berhasil terkoneksi, minta connect ulang.
+  if (connStatus === CONN_STATUS.ERROR && !existingUserRow) {
+    const err = new Error(errorMessage || 'Gagal terhubung ke akun MT5. Silakan coba lagi.');
+    err.status = 400;
+    err.conn_status = CONN_STATUS.ERROR;
+    throw err;
+  }
+
+  let stored;
+  if (existingUserRow) {
+    // Update akun yang SUDAH ADA (user_id + akun_id sama persis)
+    const { data: updated, error: updateErr } = await supabase
+      .from('user_mt5_accounts')
+      .update(patch)
+      .eq('id', existingUserRow.id)
+      .select('*')
+      .single();
+    if (updateErr) throw updateErr;
+    stored = updated;
+  } else {
+    // INSERT baris BARU -- akun MT5 baru untuk user ini, TIDAK menyentuh
+    // akun-akun lain yang sudah terhubung sebelumnya.
+    const { data: inserted, error: insertErr } = await supabase
+      .from('user_mt5_accounts')
+      .insert({ user_id: userId, akun_id: akunId, ...patch })
+      .select('*')
+      .single();
+    if (insertErr) throw insertErr;
+    stored = inserted;
+  }
+
+  if (connStatus === CONN_STATUS.CONNECTED && initialTrades && initialTrades.length > 0) {
+    syncTradesToTaraptiDb(stored, { trades: initialTrades }, initialDeals).catch((err) => {
+      console.warn('[MT5] Gagal sync awal trades ke TARAPTI DB:', err.message);
+    });
+  }
+
+  // Credential invalid pada akun yang sudah pernah terhubung: status 'error'
+  // tersimpan di DB; frontend menampilkan error dan minta user connect ulang.
+  if (connStatus === CONN_STATUS.ERROR) {
+    const err = new Error(errorMessage || 'Gagal terhubung ke akun MT5. Silakan coba lagi.');
+    err.status = 400;
+    err.conn_status = CONN_STATUS.ERROR;
+    throw err;
+  }
+
+  return { account: mapGatewayAccount(gwAccount || {}, stored) };
+}
+
+export async function disconnectMyAccount(userId, akunIdOrOpts = null) {
+  // Minta gateway melepas sesi MT5 (best-effort) secara asynchronous agar tidak memblokir HTTP response
+  gatewayDisconnect().catch((err) => {
+    console.warn('[MT5] gatewayDisconnect gagal saat user disconnect (background):', err.message);
+  });
+
+  if (!akunIdOrOpts) {
+    console.warn('[MT5] disconnectMyAccount dipanggil TANPA target spesifik -- akan memutus akun user:', userId);
+  }
+
+  const row = await getMyAkunRow(userId, akunIdOrOpts);
+  if (!row) {
+    return { success: true };
+  }
+
+  const { error } = await supabase
+    .from('user_mt5_accounts')
+    .delete()
+    .eq('user_id', userId)
+    .eq('id', row.id);
+
+  if (error) throw error;
+  return { success: true };
+}
+
+export async function syncMyAccount(userId, akunId = null) {
+  const row = await getMyAkunRow(userId, akunId);
+  if (!row) {
+    const err = new Error('Belum ada akun MT5 yang terhubung');
+    err.status = 404;
+    throw err;
+  }
+
+  const creds = getAccountCredentials(row);
+  let gw = null;
+  let gwTrades = null;
+  let gwDeals = [];
+  let live = false;
+  let syncError = null;
+
+  if (creds && row.credential_saved) {
+    try {
+      gw = await getAccount(creds);
+      if (gw && (gw.login != null || gw.balance !== undefined)) {
+        live = true;
+        try {
+          gwTrades = await getTrades(creds);
+          try {
+            const dRes = await getDeals(creds);
+            gwDeals = dRes?.deals || [];
+          } catch (err) {
+            console.warn('[MT5] Gagal ambil /deals saat sync, lanjut tanpa timeline:', err.message);
+          }
+        } catch (err) {
+          console.warn('[MT5] Gagal ambil trades saat sync:', err.message);
+        }
+      }
+    } catch (e) {
+      console.warn('[MT5] Gateway sync failed:', e.message);
+      syncError = e;
+    }
+  } else {
+    syncError = new Error('Kredensial akun MT5 tidak ditemukan atau belum disimpan');
+    syncError.status = 400;
+  }
+
+  const newTrades = await getMergedTradesFromDbAndGateway(row, gwTrades, gwDeals);
+
+  // Record equity snapshot & calculate performance metrics
+  if (live && gw) {
+    await recordEquitySnapshot(row, gw);
+  }
+  const perfMetrics = await calculateAccountPerformance(
+    row,
+    live ? gw : row.snapshot?.account,
+    gwDeals,
+    newTrades
+  );
+
+  let connStatus = row.conn_status || CONN_STATUS.DISCONNECTED;
+  let errorMessage = row.error_message || null;
+
+  if (live) {
+    connStatus = CONN_STATUS.CONNECTED;
+    errorMessage = null;
+  } else if (syncError) {
+    if (isAuthError(syncError)) {
+      connStatus = CONN_STATUS.ERROR;
+      errorMessage = 'Credential MT5 invalid atau sudah kedaluwarsa. Silakan hubungkan ulang akun Anda.';
+    } else {
+      connStatus = CONN_STATUS.RECONNECTING;
+      errorMessage = syncError.body?.detail || syncError.message || GATEWAY_UNAVAILABLE_MSG;
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const { data: updated, error } = await supabase
+    .from('user_mt5_accounts')
+    .update({
+      status: 'connected',
+      conn_status: connStatus,
+      last_connected_at: live ? nowIso : (row.last_connected_at || null),
+      error_message: errorMessage,
+      updated_at: nowIso,
+      peak_equity: perfMetrics.peak_equity,
+      total_deposit: perfMetrics.total_deposit,
+      total_withdrawal: perfMetrics.total_withdrawal,
+      initial_deposit: perfMetrics.initial_deposit,
+      snapshot: {
+        ...row.snapshot,
+        account: {
+          ...(live ? gw : row.snapshot?.account),
+          ...perfMetrics,
+        },
+        trades: newTrades,
+        fetched_at: live ? nowIso : (row.snapshot?.fetched_at || row.updated_at || nowIso),
+      },
+    })
+    .eq('id', row.id)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+
+  if (syncError) {
+    const err = new Error(errorMessage);
+    err.status = syncError.status || 400;
+    err.conn_status = connStatus;
+    throw err;
+  }
+
+  return {
+    success: true,
+    account: mapGatewayAccount(gw || row.snapshot?.account || {}, updated, perfMetrics),
+    tradesCount: newTrades.length,
+  };
+}
+
+export async function listMyAccounts(userId) {
+  const { data: rows, error } = await supabase
+    .from('user_mt5_accounts')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+
+  const mapped = await Promise.all((rows || []).map(async (row) => {
+    const fallback = row.snapshot?.account || {
+      login: row.akun_id,
+      server: row.server || row.snapshot?.requested_server || 'Axi-US50-Demo',
+      broker: row.broker || row.snapshot?.requested_broker || 'Axi',
+      balance: 0,
+      equity: 0,
+      profit: 0,
+      margin: 0,
+      margin_free: 0,
+      margin_level: 0,
+      currency: 'USD',
+      leverage: 100,
+    };
+
+    const connStatus = row.conn_status || (row.status === 'connected' ? CONN_STATUS.CONNECTED : CONN_STATUS.DISCONNECTED);
+    const metrics = await calculateAccountPerformance(row);
+    return mapGatewayAccount(row.snapshot?.account || fallback, { ...row, conn_status: connStatus }, metrics);
+  }));
+
+  return { accounts: mapped };
+}
+
+export async function listMyPositions(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
+  if (!row) return { positions: [], count: 0 };
+
+  const creds = getAccountCredentials(row);
+  let gwPositions = null;
+
+  if (creds && row.credential_saved) {
+    try {
+      gwPositions = await getPositions(creds);
+    } catch (err) {
+      console.warn('[MT5] Gagal ambil positions dari gateway, fallback ke snapshot:', err.message);
+    }
+  }
+
+  if (gwPositions) {
+    const rawPos = gwPositions.positions || gwPositions.data || (Array.isArray(gwPositions) ? gwPositions : []);
+    const positions = rawPos.map((p) => ({
+      ticket: String(p.ticket ?? p.id ?? ''),
+      symbol: p.symbol ?? '',
+      type: normalizePositionType(p.type, p.side),
+      volume: parseFloat(p.volume || p.lots) || 0,
+      lots: parseFloat(p.volume || p.lots) || 0,
+      openPrice: parseFloat(p.open_price || p.price) || 0,
+      currentPrice: parseFloat(p.current_price || p.price_current) || 0,
+      sl: parseFloat(p.sl) || 0,
+      tp: parseFloat(p.tp) || 0,
+      profit: parseFloat(p.profit) || 0,
+      swap: parseFloat(p.swap) || 0,
+      comment: p.comment || '',
+    }));
+
+    supabase
+      .from('user_mt5_accounts')
+      .update({
+        snapshot: {
+          ...row.snapshot,
+          positions,
+          fetched_at: new Date().toISOString(),
+        },
+      })
+      .eq('id', row.id)
+      .then(() => {})
+      .catch((e) => console.warn('[MT5] Gagal update snapshot positions:', e.message));
+
+    return { positions, count: positions.length };
+  }
+
+  const snapshotPositions = row.snapshot?.positions || [];
+  return { positions: snapshotPositions, count: snapshotPositions.length };
+}
+
+export async function listMyDeals(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
+  if (!row) return { deals: [], count: 0 };
+
+  const limitNum = typeof optsOrAkunId === 'object' && optsOrAkunId !== null
+    ? (Number(optsOrAkunId.limit) || 200)
+    : 200;
+  const creds = getAccountCredentials(row);
+  let gwDeals = null;
+
+  if (creds && row.credential_saved) {
+    try {
+      gwDeals = await getDeals(creds);
+    } catch (err) {
+      console.warn('[MT5] Gagal ambil deals dari gateway, fallback ke snapshot:', err.message);
+    }
+  }
+
+  if (gwDeals) {
+    const rawDeals = gwDeals.deals || gwDeals.data || (Array.isArray(gwDeals) ? gwDeals : []);
+    const deals = rawDeals.slice(0, limitNum).map((d) => ({
+      ticket: String(d.ticket ?? ''),
+      order: String(d.order ?? ''),
+      position_id: String(d.position_id ?? ''),
+      symbol: d.symbol ?? '',
+      type: normalizeDealType(d.type),
+      entry: d.entry,
+      volume: parseFloat(d.volume) || 0,
+      price: parseFloat(d.price) || 0,
+      profit: parseFloat(d.profit) || 0,
+      swap: parseFloat(d.swap) || 0,
+      commission: parseFloat(d.commission) || 0,
+      time: d.time_msc != null ? new Date(d.time_msc).toISOString() : (d.time ? new Date(d.time * 1000).toISOString() : null),
+      comment: d.comment || '',
+    }));
+
+    supabase
+      .from('user_mt5_accounts')
+      .update({
+        snapshot: {
+          ...row.snapshot,
+          deals,
+          fetched_at: new Date().toISOString(),
+        },
+      })
+      .eq('id', row.id)
+      .then(() => {})
+      .catch((e) => console.warn('[MT5] Gagal update snapshot deals:', e.message));
+
+    return { deals, count: deals.length };
+  }
+
+  const snapshotDeals = row.snapshot?.deals || [];
+  return { deals: snapshotDeals.slice(0, limitNum), count: snapshotDeals.length };
+}
+
+export async function listMyOrders(userId, optsOrAkunId = {}) {
+  const row = await getMyAkunRow(userId, optsOrAkunId);
+  if (!row) return { orders: [], count: 0 };
+
+  const creds = getAccountCredentials(row);
+  let gwOrders = null;
+
+  if (creds && row.credential_saved) {
+    try {
+      gwOrders = await getOrders(creds);
+    } catch (err) {
+      console.warn('[MT5] Gagal ambil orders dari gateway, fallback ke snapshot:', err.message);
+    }
+  }
+
+  if (gwOrders) {
+    const rawOrders = gwOrders.orders || gwOrders.data || (Array.isArray(gwOrders) ? gwOrders : []);
+    const orders = rawOrders.map((o) => ({
+      ticket: String(o.ticket ?? ''),
+      symbol: o.symbol ?? '',
+      type: normalizeOrderType(o.type ?? o.side),
+      volume: parseFloat(o.volume || o.lots) || 0,
+      openPrice: parseFloat(o.open_price || o.price) || 0,
+      sl: parseFloat(o.sl) || 0,
+      tp: parseFloat(o.tp) || 0,
+      state: o.state || 'PENDING',
+      comment: o.comment || '',
+    }));
+
+    supabase
+      .from('user_mt5_accounts')
+      .update({
+        snapshot: {
+          ...row.snapshot,
+          orders,
+          fetched_at: new Date().toISOString(),
+        },
+      })
+      .eq('id', row.id)
+      .then(() => {})
+      .catch((e) => console.warn('[MT5] Gagal update snapshot orders:', e.message));
+
+    return { orders, count: orders.length };
+  }
+
+  const snapshotOrders = row.snapshot?.orders || [];
+  return { orders: snapshotOrders, count: snapshotOrders.length };
+}

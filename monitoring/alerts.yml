@@ -1,0 +1,243 @@
+# monitoring/alerts.yml
+# STEP 14 — 14 Alert Rules Produksi TARAPTI (Bab 20)
+#
+# Semua 14 alert dari blueprint diimplementasikan di sini.
+#
+# SUMBER METRIC per alert:
+#   [${NAME}] = metric yang di-export oleh JOB `tarapti-backend`
+#               (Railway Node.js — file server/monitoring/metrics.js)
+#   [g]       = metric yang di-export oleh JOB `tarapti-gateway`
+#               (VPS Python — script scripts/gateway/monitoring_gateway_addendum.py)
+#               WAJIB dipasang di worker_v3.py/app.py VPS agar alert aktif.
+#   [g:tf]    = metric textfile collector (node_exporter) di VPS, dihasilkan
+#               scripts/backup/export_prometheus_textfile.ps1
+#
+# Semua metric di bawah TIDAK tergantung pada metric palsu — masing-masing
+# dihitung dari kondisi nyata (query DB ringan, counter runtime, state file).
+# Periksa monitoring/README.md untuk peta metric → sumber data.
+
+groups:
+  - name: tarapti_production_alerts
+    rules:
+
+      # -------------------------------------------------------------------
+      # ALERT #1 — Queue pending/failed > 500
+      #   metric: ${tarapti_queue_pending}, ${tarapti_queue_failed}
+      # -------------------------------------------------------------------
+      - alert: QueuePendingHigh
+        expr: tarapti_queue_pending > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue pending tinggi ({{ $value }})"
+          description: "Lebih dari 500 akun berstatus pending di fetch_queue selama 5 menit. Worker mungkin lambat atau mati."
+
+      - alert: QueueFailedHigh
+        expr: tarapti_queue_failed > 500
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Queue failed sangat tinggi ({{ $value }})"
+          description: "Lebih dari 500 akun gagal sync. Periksa logs untuk error_type terbanyak."
+
+      # -------------------------------------------------------------------
+      # ALERT #2 — Worker lag (heartbeat) > 10 menit
+      #   metric: [g] tarapti_worker_heartbeat_seconds (detik sejak heartbeat
+      #   terakhir per worker_id, di-update tiap siklus worker_v3.py).
+      #   Fallback: ${tarapti_worker_active} == 0 selama 10m (tidak ada worker).
+      # -------------------------------------------------------------------
+      - alert: WorkerHeartbeatLag
+        expr: tarapti_worker_heartbeat_seconds > 600
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker lag heartbeat > 10 menit ({{ $value }} detik)"
+          description: "Worker {{ $labels.worker_id }} tidak mengirim heartbeat selama lebih dari 10 menit. Akun yang jadi tanggung jawabnya berpotensi berhenti di-sync."
+
+      - alert: NoActiveWorkers
+        # sum() antar reporter (backend Railway + gateway VPS keduanya query
+        # worker_registry dari DB yang sama). Tanpa sum, reporter yang membaca
+        # 0 (mis. DB tak terjangkau) bisa memicu false positive saat reporter
+        # lain masih melihat worker aktif.
+        expr: sum(tarapti_worker_active) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tidak ada worker aktif selama 10 menit"
+          description: "worker_registry tidak mendeteksi worker aktif. Semua sync berhenti. Cek NSSM/Linux service di VPS."
+
+      # -------------------------------------------------------------------
+      # ALERT #3 — MT5 login failures > 20/jam
+      #   metric: [g] tarapti_mt5_login_failures_total (di-increment worker
+      #   tiap login MT5 gagal untuk sebuah akun).
+      # -------------------------------------------------------------------
+      - alert: MT5LoginFailuresHigh
+        expr: increase(tarapti_mt5_login_failures_total[1h]) > 20
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MT5 login failures tinggi ({{ $value }}/jam)"
+          description: "Lebih dari 20 kegagalan login MT5 dalam 1 jam. Cek kredensial akun atau status server broker."
+
+      # -------------------------------------------------------------------
+      # ALERT #4 — equity_snapshots table size > 50GB
+      #   metric: ${tarapti_equity_snapshots_size_bytes}
+      #   (query pg_total_relation_size tiap /metrics di-scrape)
+      # -------------------------------------------------------------------
+      - alert: EquitySnapshotTableLarge
+        expr: tarapti_equity_snapshots_size_bytes > 53687091200
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tabel equity_snapshots > 50GB"
+          description: "Tabel equity_snapshots ({{ $value | humanize1024 }}B) mendekati batas kritis. Periksa partisi dan jalankan DETACH PARTITION untuk bulan lama."
+
+      # -------------------------------------------------------------------
+      # ALERT #5 — Retry rate > 80% dalam 1 jam
+      #   metric: ${tarapti_sync_errors_total} + ${tarapti_sync_success_total}
+      #   (counter backend), diperkuat [g] counter worker_v3.py.
+      # -------------------------------------------------------------------
+      - alert: SyncRetryRateHigh
+        expr: |
+          (
+            increase(tarapti_sync_errors_total[1h])
+            /
+            (increase(tarapti_sync_errors_total[1h]) + increase(tarapti_sync_success_total[1h]) + 0.001)
+          ) > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Retry rate sync > 80%"
+          description: "Lebih dari 80% sync dalam 1 jam adalah retry/gagal. Sistem dalam kondisi tidak stabil."
+
+      # -------------------------------------------------------------------
+      # ALERT #6 — action='equity_snapshot_failed' di logs
+      #   metric: [g] tarapti_log_action_total{action="equity_snapshot_failed"}
+      #   (di-increment tiap pekerja mencatat aksi tersebut ke tabel logs)
+      # -------------------------------------------------------------------
+      - alert: EquitySnapshotFailed
+        expr: increase(tarapti_log_action_total{action="equity_snapshot_failed"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "equity_snapshot_failed terdeteksi"
+          description: "Ada kegagalan equity snapshot dalam 1 jam terakhir. Investigasi partisi tabel equity_snapshots."
+
+      # -------------------------------------------------------------------
+      # ALERT #7 — action='deal_error' di logs
+      #   metric: [g] tarapti_log_action_total{action="deal_error"}
+      # -------------------------------------------------------------------
+      - alert: DealErrorDetected
+        expr: increase(tarapti_log_action_total{action="deal_error"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "deal_error terdeteksi"
+          description: "Ada deal_error dalam 1 jam. Mungkin ada tipe deal baru dari broker yang belum ditangani."
+
+      # -------------------------------------------------------------------
+      # ALERT #8 — Health check MT5 gagal 3x berturut-turut
+      #   metric: [g] tarapti_mt5_health_check_consecutive_failures
+      # -------------------------------------------------------------------
+      - alert: MT5HealthCheckFailed
+        expr: tarapti_mt5_health_check_consecutive_failures >= 3
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MT5 health check gagal 3x berturut-turut"
+          description: "Instance MT5 tidak responsif. Sistem akan mencoba restart (dengan batas 5x/jam per instance)."
+
+      # -------------------------------------------------------------------
+      # ALERT #9 — Worker ID duplikat
+      #   metric: [g] tarapti_duplicate_worker_id_total
+      #   (validasi startup worker_v3.py mendeteksi worker_id yang sama
+      #   sudah aktif di worker_registry)
+      # -------------------------------------------------------------------
+      - alert: DuplicateWorkerId
+        expr: tarapti_duplicate_worker_id_total > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker ID duplikat terdeteksi"
+          description: "Ada dua worker dengan ID yang sama berjalan bersamaan. Bisa menyebabkan race condition pada fetch_queue."
+
+      # -------------------------------------------------------------------
+      # ALERT #10 — action='unhandled_deal' per hari
+      #   metric: [g] tarapti_log_action_total{action="unhandled_deal"}
+      # -------------------------------------------------------------------
+      - alert: UnhandledDealHigh
+        expr: increase(tarapti_log_action_total{action="unhandled_deal"}[24h]) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "unhandled_deal > 10 per hari ({{ $value }})"
+          description: "Lebih dari 10 deal tidak tertangani dalam 24 jam. Cek apakah ada tipe deal baru dari broker."
+
+      # -------------------------------------------------------------------
+      # ALERT #11 — MT5 restart limit 5x/jam per instance
+      #   metric: [g] tarapti_mt5_restarts_total{instance_path=...}
+      #   (di-increment restart_mt5_instance() di worker_v3.py)
+      # -------------------------------------------------------------------
+      - alert: MT5RestartLimitReached
+        expr: increase(tarapti_mt5_restarts_total[1h]) >= 5
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MT5 restart limit tercapai ({{ $value }}x/jam)"
+          description: "Instance MT5 {{ $labels.instance_path }} sudah restart 5x dalam 1 jam. Sync untuk instance ini dihentikan. Perlu intervensi manual."
+
+      # -------------------------------------------------------------------
+      # ALERT #12 — Position-context cache miss meningkat abnormal
+      #   metric: [g] tarapti_cache_miss_total
+      #   (get_position_full_context() di mt5_connector.py)
+      # -------------------------------------------------------------------
+      - alert: CacheMissRateHigh
+        expr: increase(tarapti_cache_miss_total[1h]) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Position-context cache miss tinggi ({{ $value }}/jam)"
+          description: "Cache miss history_deals_get(position=...) tinggi. Bisa mengindikasikan akun dengan volume trading sangat besar yang membebani API MT5."
+
+      # -------------------------------------------------------------------
+      # ALERT #13 — Backup off-site gagal 2 hari berturut-turut
+      #   metric: [g:tf] tarapti_backup_offsite_consecutive_failures
+      #   (backup_tarapti.ps1 menulis state → export_prometheus_textfile.ps1)
+      # -------------------------------------------------------------------
+      - alert: BackupOffSiteFailedConsecutive
+        expr: tarapti_backup_offsite_consecutive_failures >= 2
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backup off-site gagal 2 hari berturut-turut"
+          description: "Tidak ada salinan backup valid di luar VPS produksi selama 2 hari. PRIORITAS TERTINGGI — periksa backup_error.log dan konfigurasi S3."
+
+      # -------------------------------------------------------------------
+      # ALERT #14 — Service worker_v3.py / app.py down > 5 menit
+      #   metric: [g:tf] tarapti_service_down_minutes
+      #   (scheduled check service health → export_prometheus_textfile.ps1,
+      #    atau systemd/node_exporter di Linux)
+      # -------------------------------------------------------------------
+      - alert: ServiceNotRestartedIn5Min
+        expr: tarapti_service_down_minutes >= 5
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service TARAPTI mati > 5 menit"
+          description: "worker_v3.py atau app.py berhenti dan tidak restart otomatis. Akun berhenti di-sync. Cek NSSM/always-up di VPS."
