@@ -13,11 +13,29 @@ let nextCountryId = 1;
 let nextProvinceId = 1;
 let nextCityId = 1;
 
+async function fetchWithRetry(url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+      return await res.json();
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await delay(600);
+    }
+  }
+}
+
 async function fetchGeonamesCountries() {
   const url = `http://api.geonames.org/countryInfoJSON?username=${GEONAMES_USERNAME}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if (!data.geonames) {
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.geonames) {
+      throw new Error(data?.status?.message || 'GeoNames error');
+    }
+    return data.geonames;
+  } catch {
     console.warn('GeoNames API error/limit reached. Using static fallback for countries...');
     const staticPath = path.join(__dirname, '..', '..', 'data', 'locations', 'countries.json');
     if (fs.existsSync(staticPath)) {
@@ -27,33 +45,57 @@ async function fetchGeonamesCountries() {
     }
     return [];
   }
-  return data.geonames;
 }
 
 async function fetchGeonamesProvinces(iso2) {
   const url = `http://api.geonames.org/searchJSON?country=${iso2}&featureCode=ADM1&maxRows=1000&username=${GEONAMES_USERNAME}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data.geonames || [];
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    return data.geonames || [];
+  } catch {
+    return [];
+  }
 }
 
 async function fetchGeonamesCities(iso2) {
   const url = `http://api.geonames.org/searchJSON?country=${iso2}&featureCode=ADM2&maxRows=1000&username=${GEONAMES_USERNAME}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data.geonames || [];
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    return data.geonames || [];
+  } catch {
+    return [];
+  }
 }
 
-async function fetchWilayahIdProvinces() {
-  const res = await fetch('https://wilayah.id/api/provinces.json');
-  const data = await res.json();
-  return data.data || [];
+function formatProvinceName(rawName) {
+  const upper = rawName.trim().toUpperCase();
+  if (upper === 'DKI JAKARTA') return 'DKI Jakarta';
+  if (upper === 'DI YOGYAKARTA' || upper === 'DAERAH ISTIMEWA YOGYAKARTA') return 'DI Yogyakarta';
+  return upper.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
 }
 
-async function fetchWilayahIdCities(provinceCode) {
-  const res = await fetch(`https://wilayah.id/api/regencies/${provinceCode}.json`);
-  const data = await res.json();
-  return data.data || [];
+function cleanRegencyName(rawName) {
+  const upper = rawName.toUpperCase();
+  const isKota = upper.startsWith('KOTA ');
+  const isKab = upper.startsWith('KABUPATEN ');
+  const stripped = upper
+    .replace(/^KOTA\s+/, '')
+    .replace(/^KABUPATEN\s+/, '')
+    .trim();
+
+  const cleanName = stripped.split(' ').map(w => {
+    if (/^[IVXLCDM]+$/.test(w)) return w;
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  }).join(' ');
+
+  return {
+    cleanName,
+    isKota,
+    isKab,
+    originalType: isKota ? 'Kota' : isKab ? 'Kabupaten' : 'Kota/Kabupaten'
+  };
 }
 
 async function runImport() {
@@ -62,8 +104,15 @@ async function runImport() {
   let totalCountries = 0, totalProvinces = 0, totalCities = 0;
 
   try {
+    // Siapkan kolom & tabel
+    await pool.query(`ALTER TABLE provinces ADD COLUMN IF NOT EXISTS source_id TEXT;`);
+    await pool.query(`ALTER TABLE cities ADD COLUMN IF NOT EXISTS source_id TEXT;`);
+    await pool.query(`ALTER TABLE cities ADD COLUMN IF NOT EXISTS original_type TEXT;`);
+
+    // Reset tabel
+    await pool.query(`TRUNCATE TABLE countries, provinces, cities CASCADE;`);
+
     const gnCountries = await fetchGeonamesCountries();
-    // Proses semua yang didapat (jika pakai demo mungkin cuma fallback, jika pakai real akan dapat semua)
     for (const c of gnCountries) {
       const countryId = nextCountryId++;
       await pool.query(
@@ -73,48 +122,51 @@ async function runImport() {
       totalCountries++;
 
       if (c.countryCode === 'ID') {
-        console.log('  -> Memproses INDONESIA via wilayah.id...');
-        const idProvinces = await fetchWilayahIdProvinces();
+        console.log('  -> Memproses INDONESIA via emsifa/api-wilayah-indonesia (Kemendagri)...');
+        const idProvinces = await fetchWithRetry('https://emsifa.github.io/api-wilayah-indonesia/api/provinces.json');
+        
         for (const p of idProvinces) {
           const provinceId = nextProvinceId++;
+          const provName = formatProvinceName(p.name);
           await pool.query(
             `INSERT INTO provinces (id, country_id, name, source_id) VALUES ($1, $2, $3, $4)`,
-            [provinceId, countryId, p.name, p.code]
+            [provinceId, countryId, provName, String(p.id)]
           );
           totalProvinces++;
 
-          const idCities = await fetchWilayahIdCities(p.code);
+          const idCities = await fetchWithRetry(`https://emsifa.github.io/api-wilayah-indonesia/api/regencies/${p.id}.json`);
           const cityMap = new Map();
+
           for (const city of idCities) {
-            let originalType = '';
-            let cleanName = city.name.toUpperCase();
-            if (cleanName.startsWith('KOTA ')) {
-              originalType = 'Kota';
-              cleanName = cleanName.replace('KOTA ', '').trim();
-            } else if (cleanName.startsWith('KABUPATEN ')) {
-              originalType = 'Kabupaten';
-              cleanName = cleanName.replace('KABUPATEN ', '').trim();
-            }
-            // Title Case
-            cleanName = cleanName.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+            const { cleanName, isKota, originalType } = cleanRegencyName(city.name);
 
             if (cityMap.has(cleanName)) {
-              const existing = cityMap.get(cleanName);
-              existing.original_type = existing.original_type + '/' + originalType;
+              // Jika pasangan Kota + Kabupaten dengan nama sama: simpan Kota, buang Kabupaten
+              if (isKota) {
+                cityMap.set(cleanName, {
+                  source_id: String(city.id),
+                  name: cleanName,
+                  original_type: 'Kota'
+                });
+              }
             } else {
-              cityMap.set(cleanName, { source_id: city.code, original_type: originalType });
+              cityMap.set(cleanName, {
+                source_id: String(city.id),
+                name: cleanName,
+                original_type: originalType
+              });
             }
           }
 
-          for (const [name, cityData] of cityMap.entries()) {
+          for (const cityData of cityMap.values()) {
             const cityId = nextCityId++;
             await pool.query(
               `INSERT INTO cities (id, province_id, name, source_id, original_type) VALUES ($1, $2, $3, $4, $5)`,
-              [cityId, provinceId, name, cityData.source_id, cityData.original_type]
+              [cityId, provinceId, cityData.name, cityData.source_id, cityData.original_type]
             );
             totalCities++;
           }
-          await delay(200);
+          await delay(100);
         }
       } else {
         console.log(`  -> Memproses ${c.countryName} via GeoNames...`);
@@ -146,9 +198,14 @@ async function runImport() {
              if (err.code !== '23505') throw err;
           }
         }
-        await delay(500);
+        await delay(300);
       }
     }
+
+    // Constraint Unik
+    await pool.query(`ALTER TABLE cities DROP CONSTRAINT IF EXISTS cities_province_name_key;`);
+    await pool.query(`ALTER TABLE cities ADD CONSTRAINT cities_province_name_key UNIQUE (province_id, name);`);
+
     console.log(`\n✅ IMPORT SELESAI! Negara: ${totalCountries}, Provinsi: ${totalProvinces}, Kota: ${totalCities}`);
   } catch (err) {
     console.error('Error saat import:', err);
@@ -156,4 +213,7 @@ async function runImport() {
     await pool.end();
   }
 }
-runImport();
+
+if (process.argv[1] && process.argv[1].endsWith('importLocationsApi.js')) {
+  runImport().then(() => process.exit(0)).catch(() => process.exit(1));
+}
