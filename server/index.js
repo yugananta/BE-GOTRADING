@@ -25,6 +25,7 @@ import leaderboardRoutes from './routes/leaderboard.js';
 import pwaRoutes from './routes/pwa.js';
 import marketRoutes from './routes/market.js';
 import analysisRoutes from './routes/analysis.js';
+import settingsRoutes from './routes/settings.js';
 import metricsRoutes from './routes/metrics.js';   // STEP 14
 import { httpMetricsMiddleware } from './middleware/httpMetrics.js'; // STEP 14
 import { startReconnectMonitor } from './services/mt5ReconnectService.js'; // MT5 auto-reconnect
@@ -107,6 +108,7 @@ app.use('/api/pwa', pwaRoutes);
 // simulasi, belum integrasi feed harga/analisa sungguhan.
 app.use('/api/market', marketRoutes);
 app.use('/api/analysis', analysisRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // --- API untuk admin panel (semua route di dalamnya wajib role='admin') ---
 app.use('/api/admin', adminRoutes);

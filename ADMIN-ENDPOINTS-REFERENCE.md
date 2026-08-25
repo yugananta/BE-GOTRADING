@@ -92,8 +92,9 @@ Seluruh endpoint di bawah `/api/admin/*` diproteksi secara global oleh middlewar
 
 | Method | Path | Handler Function | Deskripsi Singkat |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/api/admin/settings` | `getSettings` | Mengambil konfigurasi global sistem (default server MT5, API keys, konfigurasi Telegram bot, FCM server key). |
-| `POST` | `/api/admin/settings` | `saveSettings`, `logAdminAction` | Menyimpan dan memperbarui konfigurasi global integrasi pada tabel singleton `admin_settings`. |
+| `GET` | `/api/admin/settings` | `getSettings` | Mengambil konfigurasi global sistem (default server MT5, API keys, konfigurasi Telegram bot, FCM server key, openAccountUrl). |
+| `POST` | `/api/admin/settings` | `saveSettings`, `logAdminAction` | Menyimpan dan memperbarui konfigurasi global integrasi pada tabel singleton `admin_settings` (termasuk `openAccountUrl`). |
+| `GET` | `/api/settings/public` | `getPublicSettings` | Endpoint publik untuk mengambil pengaturan umum yang aman (seperti `openAccountUrl`) tanpa auth admin. |
 
 ---
 

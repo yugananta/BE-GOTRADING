@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS admin_settings (
     telegram_bot_token TEXT,
     telegram_chat_id TEXT,
     fcm_server_key TEXT,
+    open_account_url TEXT,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 

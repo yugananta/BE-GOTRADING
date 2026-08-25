@@ -20,6 +20,7 @@ const COLUMN_MAP = {
   telegramBotToken: 'telegram_bot_token',
   telegramChatId: 'telegram_chat_id',
   fcmServerKey: 'fcm_server_key',
+  openAccountUrl: 'open_account_url',
 };
 
 function toCamel(row) {
@@ -32,6 +33,18 @@ export async function getSettings() {
   const { data, error } = await supabase.from('admin_settings').select('*').eq('id', 1).maybeSingle();
   if (error) throw error;
   return data ? toCamel(data) : {};
+}
+
+export async function getPublicSettings() {
+  const { data, error } = await supabase
+    .from('admin_settings')
+    .select('open_account_url')
+    .eq('id', 1)
+    .maybeSingle();
+  if (error) throw error;
+  return {
+    openAccountUrl: data?.open_account_url || 'https://www.axi.com',
+  };
 }
 
 export async function saveSettings(body) {
