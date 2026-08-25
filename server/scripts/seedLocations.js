@@ -30,7 +30,7 @@ async function seedCountries() {
   const countries = readJson(path.join(DATA_DIR, 'countries.json'));
   const rows = countries.map((c) => ({
     id: c.id, name: c.name, iso2: c.iso2, iso3: c.iso3 || null,
-    phonecode: c.phonecode || null, currency: c.currency || null, emoji: c.emoji || null,
+    phonecode: c.phonecode ? String(c.phonecode) : null, currency: c.currency || null, emoji: c.emoji || null,
   }));
   const { error } = await supabase.from('countries').upsert(rows, { onConflict: 'id' });
   if (error) throw error;
