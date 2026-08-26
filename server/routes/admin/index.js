@@ -17,6 +17,7 @@ import mt5AccountsRoutes from './mt5Accounts.js';
 import logsRoutes from './logs.js';
 import newsRoutes from './news.js';
 import settingsRoutes from './settings.js';
+import validationsRoutes from './validations.js';
 import integrationsRoutes from './integrations.js';
 
 const router = Router();
@@ -31,6 +32,7 @@ router.use('/mt5-accounts', mt5AccountsRoutes);
 router.use('/logs', logsRoutes);
 router.use('/news', newsRoutes);
 router.use('/settings', settingsRoutes);
+router.use('/validations', validationsRoutes);
 // Endpoint lepas (bukan sub-resource CRUD): /api/admin/mt5/test,
 // /api/admin/news/sync, /api/admin/broadcast -- lihat integrations.js.
 router.use('/', integrationsRoutes);

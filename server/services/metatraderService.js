@@ -950,6 +950,30 @@ export async function connectMyAccount(userId, { platform, login, password, serv
     throw err;
   }
 
+  // VALIDASI IB GOTRADING: Pastikan akun MT5 sudah diajukan dan disetujui (approved)
+  const { data: validation } = await supabase
+    .from('account_validations')
+    .select('id, status')
+    .eq('user_id', userId)
+    .eq('mt5_account_number', loginStr)
+    .eq('status', 'approved')
+    .maybeSingle();
+
+  if (!validation) {
+    const { data: userRecord } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', userId)
+      .maybeSingle();
+
+    // Bypass untuk admin atau akun yang sudah pernah terkoneksi sebelumnya (backward compatibility)
+    if (userRecord?.role !== 'admin' && !existingAccount) {
+      const err = new Error('Akun MT5 belum divalidasi oleh admin GoTrading. Silakan ajukan validasi akun Anda terlebih dahulu di menu Validasi Akun.');
+      err.status = 403;
+      throw err;
+    }
+  }
+
   const cleanServer = (server || '').trim() || null;
   const cleanBroker = (broker || '').trim() || (cleanServer ? cleanServer.split('-')[0] : null) || 'Axi';
   const passwordEnc = encryptPassword(password);
