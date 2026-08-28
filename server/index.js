@@ -52,6 +52,9 @@ const defaultAllowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
   'http://localhost:3001',
+  'capacitor://localhost',
+  'app://localhost',
+  'https://localhost',
 ];
 
 const envOrigins = [FRONTEND_URL, ADMIN_FRONTEND_URL]
@@ -70,7 +73,7 @@ app.use(cors({
     if (
       /^https?:\/\/([a-z0-9-]+\.)*gotrading\.id(:[0-9]+)?$/i.test(origin) ||
       /^https?:\/\/([a-z0-9-]+\.)*run\.app(:[0-9]+)?$/i.test(origin) ||
-      /^https?:\/\/localhost(:[0-9]+)?$/i.test(origin)
+      /^(https?|capacitor|app):\/\/localhost(:[0-9]+)?$/i.test(origin)
     ) {
       return callback(null, true);
     }
