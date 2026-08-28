@@ -5,7 +5,7 @@
 // di access token payload supaya requireAdmin bisa cek tanpa hit DB
 // di setiap request.
 
-import bcrypt from 'bcryptjs';
+import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { supabase } from '../integrations/supabase/client.js';
@@ -133,7 +133,12 @@ export async function loginUser({ email, password }) {
     throw err;
   }
 
-  const valid = await bcrypt.compare(password, user.password_hash);
+  let hashToCompare = user.password_hash;
+  if (hashToCompare && hashToCompare.startsWith('$2y$')) {
+    hashToCompare = '$2a$' + hashToCompare.substring(4);
+  }
+
+  const valid = await bcrypt.compare(password, hashToCompare);
   if (!valid) {
     const err = new Error('Email atau password salah');
     err.status = 401;

@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import bcrypt from 'bcryptjs';
+import bcrypt from 'bcrypt';
 import { supabase } from '../integrations/supabase/client.js';
 import { loginUser } from '../services/authService.js';
 
@@ -96,7 +96,11 @@ async function main() {
 
   // [5] Compare password dengan hash dari DB
   console.log(`\n[5] Menjalankan bcrypt.compare("${newPassword}", stored_hash)...`);
-  const isMatch = await bcrypt.compare(newPassword, verifyUser.password_hash);
+  let hashToCompare = verifyUser.password_hash;
+  if (hashToCompare && hashToCompare.startsWith('$2y$')) {
+    hashToCompare = '$2a$' + hashToCompare.substring(4);
+  }
+  const isMatch = await bcrypt.compare(newPassword, hashToCompare);
   console.log(`Hasil Compare: ${isMatch ? 'TRUE' : 'FALSE'}`);
 
   if (!isMatch) {
