@@ -119,10 +119,11 @@ export async function registerUser({ email, password, fullName, username, countr
 }
 
 export async function loginUser({ email, password }) {
+  const loginInput = email ? String(email).trim() : '';
   const { data: user, error } = await supabase
     .from('users')
-    .select('id, email, password_hash, role, status, verification_status')
-    .eq('email', email)
+    .select('id, email, password_hash, role, status, verification_status, username')
+    .or(`email.eq.${loginInput},username.eq.${loginInput}`)
     .maybeSingle();
 
   if (error) throw error;
